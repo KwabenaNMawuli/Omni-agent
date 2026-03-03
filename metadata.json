@@ -1,0 +1,5 @@
+{
+  "name": "Omni: AI Setup Agent",
+  "description": "An AI-powered setup assistant with an overlay control widget that provides precise instructions and automates development environment configuration.",
+  "requestFramePermissions": ["microphone"]
+}
