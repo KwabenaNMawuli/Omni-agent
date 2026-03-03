@@ -209,7 +209,3 @@ GEMINI_API_KEY=your_gemini_api_key_here
 2. Create a feature branch: `git checkout -b feature/my-feature`
 3. Make your changes and ensure `npm run lint` passes
 4. Submit a pull request
-
-## License
-
-This project is private. See the repository settings for access details.
