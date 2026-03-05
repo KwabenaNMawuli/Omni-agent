@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld('omniAPI', {
         ipcRenderer.send('set-ignore-mouse-events', ignore, opts);
     },
 
+    // Window focus control (needed for SpeechRecognition)
+    setWindowFocusable: (focusable: boolean) => ipcRenderer.invoke('window:set-focusable', focusable),
+
     // Quit the app
     quitApp: () => {
         ipcRenderer.send('app:quit');

@@ -22,7 +22,8 @@ import {
   ArrowRight,
   Sparkles,
   CircleDot,
-  Power
+  Power,
+  Brain
 } from 'lucide-react';
 import { getSetupInstructions, generateSpeech } from '../services/gemini';
 import { SetupAction, GeminiResponse, AgentMode, Point, ChatMessage, SessionState, SetupTemplate } from '../types';
@@ -93,10 +94,17 @@ const setClickThrough = (ignore: boolean) => {
 };
 
 export default function OverlayWidget({ onAction }: { onAction: (action: SetupAction) => Promise<void> }) {
+  const DEBUG_OVERLAY = (import.meta as any)?.env?.VITE_OMNI_DEBUG === '1';
+  const ALLOW_AUTOMATION = (import.meta as any)?.env?.VITE_OMNI_AUTOMATION === '1';
+
   const [state, setState] = useState<SessionState>('Idle');
   const [mode, setMode] = useState<AgentMode>('Active');
   const [isOpen, setIsOpen] = useState(false);
   const [inputText, setInputText] = useState('');
+  const [statusText, setStatusText] = useState('');
+  const [lastUserTranscript, setLastUserTranscript] = useState('');
+  const [debugEvents, setDebugEvents] = useState<string[]>([]);
+  const [isHoveringWidget, setIsHoveringWidget] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [currentResponse, setCurrentResponse] = useState<GeminiResponse | null>(null);
   const [currentActionIndex, setCurrentActionIndex] = useState(-1);
@@ -110,9 +118,25 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    // In Electron, keep the overlay click-through by default so the user can
+    // interact with other apps. Only capture mouse while hovering the widget.
+    // During Acting, ALWAYS be click-through so automation reaches the desktop.
+    setClickThrough(state === 'Acting' || !isHoveringWidget);
+  }, [state, isHoveringWidget]);
+
+  // Web Speech API recognition
   const recognitionRef = useRef<any>(null);
   const isListeningRef = useRef(false);
+  const explicitStopRef = useRef(false);
+  const autoSubmitRef = useRef(false);
   const transcriptRef = useRef('');
+  const lastSpeechTimeRef = useRef(0);
+  const silenceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restartAttemptsRef = useRef(0);
+  const userEditedRef = useRef(false);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -125,7 +149,6 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     const fullText = currentResponse.explanation;
     if (displayedText.length < fullText.length) {
       const timer = setTimeout(() => {
-        // Type 2-4 chars at a time for speed
         const chunkSize = Math.floor(Math.random() * 3) + 2;
         setDisplayedText(fullText.slice(0, displayedText.length + chunkSize));
       }, 15);
@@ -135,85 +158,227 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     }
   }, [displayedText, isTypingResponse, currentResponse]);
 
-  // Web Speech API for voice recognition
-  const startListening = useCallback(() => {
-    // If already listening, ignore (prevents race conditions)
-    if (isListeningRef.current || recognitionRef.current) return;
+  // Helper: clean up all listening resources
+  const cleanupAudio = useCallback(() => {
+    if (silenceTimeoutRef.current) { clearTimeout(silenceTimeoutRef.current); silenceTimeoutRef.current = null; }
+    if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch (_) { }
+      recognitionRef.current = null;
+    }
+  }, []);
 
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      // Fallback — focus the text input
-      inputRef.current?.focus();
+  const pushDebugEvent = useCallback((message: string) => {
+    if (!DEBUG_OVERLAY) return;
+    const ts = new Date().toLocaleTimeString();
+    setDebugEvents(prev => [`[${ts}] ${message}`, ...prev].slice(0, 12));
+  }, [DEBUG_OVERLAY]);
+
+  // ─── AUDIO RECORDING ────────────────────────────────────────────────────────
+  const startListening = useCallback(async () => {
+    if (isListeningRef.current) return;
+
+    if (state === 'Talking' || state === 'Acting') {
+      setStatusText('Busy. Please wait...');
+      pushDebugEvent('Ignored mic start while busy');
       return;
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-    recognition.maxAlternatives = 1;
+    const api = (window as any).omniAPI;
+    if (api?.setWindowFocusable) {
+      try { await api.setWindowFocusable(true); } catch (_) { }
+    }
 
-    recognition.onstart = () => {
-      isListeningRef.current = true;
-      transcriptRef.current = '';
-      setIsListening(true);
-      setState('Listening');
-    };
+    userEditedRef.current = false;
 
-    recognition.onresult = (event: any) => {
-      let finalTranscript = '';
-      let interimTranscript = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalTranscript += result[0].transcript;
-        } else {
-          interimTranscript += result[0].transcript;
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) {
+      setStatusText('Speech recognition not available on this system.');
+      if (api?.setWindowFocusable) {
+        try { await api.setWindowFocusable(false); } catch (_) { }
+      }
+      return;
+    }
+
+    try {
+      const recognition = new SR();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => {
+        isListeningRef.current = true;
+        explicitStopRef.current = false;
+        autoSubmitRef.current = false;
+        restartAttemptsRef.current = 0;
+        transcriptRef.current = '';
+        lastSpeechTimeRef.current = 0;
+        setInputText('');
+        setLastUserTranscript('');
+        setStatusText('');
+        setIsListening(true);
+        setState('Listening');
+        pushDebugEvent('Listening started');
+      };
+
+      recognition.onresult = (event: any) => {
+        let finalTranscript = '';
+        let interimTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const t = result?.[0]?.transcript || '';
+          if (result.isFinal) finalTranscript += t;
+          else interimTranscript += t;
         }
-      }
-      if (finalTranscript) {
-        transcriptRef.current += finalTranscript;
-      }
-      setInputText(transcriptRef.current + interimTranscript);
-    };
 
-    recognition.onend = () => {
-      isListeningRef.current = false;
-      recognitionRef.current = null;
-      setIsListening(false);
+        if (finalTranscript) transcriptRef.current += finalTranscript;
+        const fullText = (transcriptRef.current + interimTranscript).trim();
+        if (fullText) {
+          lastSpeechTimeRef.current = Date.now();
+          if (!userEditedRef.current) {
+            setInputText(fullText);
+            setLastUserTranscript(fullText);
+          }
+        }
+
+        // 3s after the last speech result, auto-submit
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+        silenceTimeoutRef.current = setTimeout(() => {
+          if (!isListeningRef.current) return;
+          const captured = (transcriptRef.current || fullText).trim();
+          if (captured.length < 2) return;
+          autoSubmitRef.current = true;
+          try { recognition.stop(); } catch (_) { }
+        }, 3000);
+      };
+
+      recognition.onerror = (event: any) => {
+        const err = event?.error || 'unknown';
+
+        // Common transient errors that should NOT splash on the UI.
+        // Chromium speech recognition often throws 'network' even when offline
+        // or when the internal speech service restarts.
+        if (err === 'no-speech' || err === 'aborted') return;
+
+        if (err === 'network') {
+          pushDebugEvent('Speech error: network (suppressed; will retry)');
+          setStatusText('');
+          // Let onend handle restart, but also schedule a backoff restart
+          // in case onend doesn't fire.
+          if (!explicitStopRef.current && isListeningRef.current) {
+            if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+            const attempt = restartAttemptsRef.current++;
+            const backoffMs = Math.min(8000, 400 * Math.pow(2, attempt));
+            restartTimerRef.current = setTimeout(() => {
+              if (!explicitStopRef.current && isListeningRef.current && recognitionRef.current) {
+                try { recognitionRef.current.start(); } catch (_) { }
+              }
+            }, backoffMs);
+          }
+          return;
+        }
+
+        // Permission / device errors: surface to user (these are actionable).
+        if (err === 'not-allowed' || err === 'service-not-allowed' || err === 'audio-capture') {
+          setStatusText(`Speech error: ${err}`);
+          pushDebugEvent(`Speech error: ${err}`);
+          return;
+        }
+
+        // Anything else: do not spam the UI, but keep a breadcrumb in debug.
+        pushDebugEvent(`Speech error: ${err} (suppressed)`);
+      };
+
+      recognition.onend = () => {
+        const captured = transcriptRef.current.trim();
+
+        // Clear timer
+        if (silenceTimeoutRef.current) { clearTimeout(silenceTimeoutRef.current); silenceTimeoutRef.current = null; }
+
+        // Auto-submit path (3s silence)
+        if (autoSubmitRef.current && captured.length > 2) {
+          isListeningRef.current = false;
+          recognitionRef.current = null;
+          setIsListening(false);
+          if (api?.setWindowFocusable) {
+            try { api.setWindowFocusable(false); } catch (_) { }
+          }
+          setState('Listening');
+          setInputText(captured);
+          setLastUserTranscript(captured);
+          setTimeout(() => handleSubmit(captured), 100);
+          return;
+        }
+
+        // User manually stopped: keep review UI if we have text
+        if (explicitStopRef.current) {
+          isListeningRef.current = false;
+          recognitionRef.current = null;
+          setIsListening(false);
+          if (api?.setWindowFocusable) {
+            try { api.setWindowFocusable(false); } catch (_) { }
+          }
+          if (captured.length > 0) {
+            setState('Listening');
+            setInputText(captured);
+            setLastUserTranscript(captured);
+          } else {
+            setState('Idle');
+          }
+          return;
+        }
+
+        // Unexpected end (common in Web Speech): restart to keep listening
+        try {
+          const attempt = restartAttemptsRef.current++;
+          const backoffMs = Math.min(8000, 400 * Math.pow(2, attempt));
+          if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+          restartTimerRef.current = setTimeout(() => {
+            try { recognition.start(); } catch (_) { }
+          }, backoffMs);
+          setIsListening(true);
+          setState('Listening');
+          return;
+        } catch (_) {
+          // Fall back to idle
+          isListeningRef.current = false;
+          recognitionRef.current = null;
+          setIsListening(false);
+          if (api?.setWindowFocusable) {
+            try { api.setWindowFocusable(false); } catch (_) { }
+          }
+          setState('Idle');
+        }
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err: any) {
+      setStatusText(`Speech init error: ${err?.message || String(err)}`);
+      pushDebugEvent(`Speech init error: ${err?.message || String(err)}`);
+      if (api?.setWindowFocusable) {
+        try { await api.setWindowFocusable(false); } catch (_) { }
+      }
       setState('Idle');
-      // Auto-submit if we captured meaningful speech
-      const captured = transcriptRef.current.trim();
-      if (captured.length > 2) {
-        setInputText(captured);
-        // Use a short delay so the state updates propagate before submit
-        setTimeout(() => handleSubmit(captured), 100);
-      }
-    };
-
-    recognition.onerror = (event: any) => {
-      // 'no-speech' and 'aborted' are non-fatal — don't kill the session
-      if (event.error === 'no-speech' || event.error === 'aborted') {
-        console.warn('Speech recognition:', event.error);
-        return;
-      }
-      console.error('Speech recognition error:', event.error);
-      isListeningRef.current = false;
-      recognitionRef.current = null;
       setIsListening(false);
-      setState('Idle');
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
-  }, []);
+      isListeningRef.current = false;
+    }
+  }, [pushDebugEvent, state]);
 
   const stopListening = useCallback(() => {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch (_) {}
-      // The onend handler will clean up state and auto-submit
+    if (!isListeningRef.current) return;
+    if (silenceTimeoutRef.current) { clearTimeout(silenceTimeoutRef.current); silenceTimeoutRef.current = null; }
+    if (restartTimerRef.current) { clearTimeout(restartTimerRef.current); restartTimerRef.current = null; }
+    explicitStopRef.current = true;
+    const api = (window as any).omniAPI;
+    if (api?.setWindowFocusable) {
+      try { api.setWindowFocusable(false); } catch (_) { }
     }
-  }, []);
+    try { recognitionRef.current?.stop(); } catch (_) { }
+    cleanupAudio();
+  }, [cleanupAudio]);
 
   const playAudio = async (text: string) => {
     setIsSpeaking(true);
@@ -282,6 +447,9 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     const query = text || inputText.trim();
     if (!query) return;
 
+    setLastUserTranscript(query);
+    pushDebugEvent('Submitting request to AI');
+
     // Add user message
     const userMsg: ChatMessage = {
       id: generateId(),
@@ -291,29 +459,22 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     };
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
+    setStatusText('');
     setState('Talking');
 
     // Capture screen context
     const screenshot = await captureScreen();
 
-    // Fetch visual buffer from Electron if available
+    // Fetch contextual data from Electron if available
     const api = (window as any).omniAPI;
     let visualBuffer = undefined;
     let screenDimensions = undefined;
     let environmentInfo = undefined;
     if (api?.getVisualBuffer) {
-      try {
-        visualBuffer = await api.getVisualBuffer();
-      } catch (e) {
-        console.error('Failed to get visual buffer:', e);
-      }
+      try { visualBuffer = await api.getVisualBuffer(); } catch (e) { console.error(e); }
     }
     if (api?.getScreenDimensions) {
-      try {
-        screenDimensions = await api.getScreenDimensions();
-      } catch (e) {
-        console.error('Failed to get screen dimensions:', e);
-      }
+      try { screenDimensions = await api.getScreenDimensions(); } catch (e) { console.error(e); }
     }
     if (api?.getEnvInfo) {
       try {
@@ -324,63 +485,97 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
           nodeVersion: info.nodeVersion,
           electronVersion: info.electronVersion,
         };
-      } catch (e) {
-        console.error('Failed to get env info:', e);
-      }
+      } catch (e) { console.error(e); }
     }
 
     // Call Gemini with conversation history + visual context
-    const res = await getSetupInstructions(
-      query,
-      mode,
-      screenshot || undefined,
-      visualBuffer,
-      messages,
-      screenDimensions,
-      environmentInfo
-    );
+    try {
+      pushDebugEvent('Capturing screen/context...');
+      const res = await getSetupInstructions(
+        query,
+        mode,
+        ALLOW_AUTOMATION,
+        screenshot || undefined,
+        visualBuffer,
+        messages,
+        screenDimensions,
+        environmentInfo
+      );
 
-    setCurrentResponse(res);
+      pushDebugEvent('AI response received');
+      if (res.modelUsed) pushDebugEvent(`Thinking model: ${res.modelUsed}`);
+      setCurrentResponse(res);
 
-    // Add assistant message
-    const assistantMsg: ChatMessage = {
-      id: generateId(),
-      role: 'assistant',
-      content: res.explanation,
-      actions: res.actions,
-      timestamp: new Date(),
-      status: res.status === 'error' ? 'error' : 'complete',
-    };
-    setMessages(prev => [...prev, assistantMsg]);
+      // Add assistant message
+      const assistantMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: res.explanation,
+        actions: res.actions,
+        timestamp: new Date(),
+        status: res.status === 'error' ? 'error' : 'complete',
+      };
+      setMessages(prev => [...prev, assistantMsg]);
 
-    // Start typing animation
-    setDisplayedText('');
-    setIsTypingResponse(true);
+      // Start typing animation and show response widget
+      setDisplayedText('');
+      setIsTypingResponse(true);
+      setState('Responding');
 
-    setState('Idle');
+      // If there are actions, execute them after a short delay so user sees the response
+      if (res.actions.length > 0) {
+        if (ALLOW_AUTOMATION) {
+          pushDebugEvent(`Executing ${res.actions.length} action(s)...`);
+          setTimeout(() => executeActions(res), 2000);
+        } else {
+          pushDebugEvent('Automation disabled; ignoring suggested actions');
+        }
+      }
+    } catch (err: any) {
+      console.error('Gemini API error:', err);
+      pushDebugEvent(`AI error: ${err.message || String(err)}`);
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: `Error: ${err.message || 'Failed to get AI response. Check API key.'}`,
+        timestamp: new Date(),
+        status: 'error',
+      };
+      setMessages(prev => [...prev, errorMsg]);
+      setCurrentResponse({ explanation: err.message || 'Failed to get AI response.', actions: [], status: 'error' });
+      setDisplayedText(err.message || 'Failed to get AI response.');
+      setState('Responding');
+    }
   };
 
-  const runActions = async () => {
-    if (!currentResponse || currentResponse.actions.length === 0) return;
+  const executeActions = async (res: GeminiResponse) => {
+    if (!ALLOW_AUTOMATION) {
+      pushDebugEvent('Automation disabled; not executing actions');
+      setState('Responding');
+      return;
+    }
+    if (!res || res.actions.length === 0) {
+      setState('Responding');
+      return;
+    }
 
     setState('Acting');
     // Enable click-through during action execution so nut.js clicks reach the desktop
     setClickThrough(true);
 
-    for (let i = 0; i < currentResponse.actions.length; i++) {
-      const action = currentResponse.actions[i];
+    for (let i = 0; i < res.actions.length; i++) {
+      const action = res.actions[i];
       setCurrentActionIndex(i);
       setCurrentActionDesc(action.description);
 
       if (action.coordinates) {
         setCurrentCoords(action.coordinates);
       } else {
-        setCurrentCoords(null); // Clear pointer if action has no coordinates
+        setCurrentCoords(null);
       }
 
       if (mode === 'Passive') {
         await playAudio(action.description);
-        // In passive mode, wait for screen stability before next step
         const api = (window as any).omniAPI;
         if (api?.waitForScreenStable) {
           await api.waitForScreenStable({ timeoutMs: 10000 });
@@ -388,29 +583,24 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
           await new Promise(r => setTimeout(r, 3000));
         }
       } else {
-        // Execute the action and wait for it to fully complete via IPC
         await onAction(action);
 
-        // Wait for the screen to visually stabilize before proceeding
-        // This replaces all fixed delays — the system observes the actual
-        // screen and only moves on once things stop changing.
         const api = (window as any).omniAPI;
         if (api?.waitForScreenStable) {
           const result = await api.waitForScreenStable({
-            timeoutMs: action.type === 'command' ? 120000 : 15000, // 2min for commands, 15s otherwise
+            timeoutMs: action.type === 'command' ? 120000 : 15000,
             intervalMs: action.type === 'command' ? 1500 : 800,
           });
           console.log(`[Omni] Screen ${result.stable ? 'stabilized' : 'timed out'} after ${result.elapsed}ms`);
         } else {
-          // Browser fallback — short delay
           await new Promise(r => setTimeout(r, 1000));
         }
       }
     }
 
-    // Restore click-through for the widget area
     setClickThrough(false);
-    setState('Idle');
+    pushDebugEvent('Actions complete');
+    setState('Responding');
     setCurrentActionIndex(-1);
     setCurrentCoords(null);
     setCurrentActionDesc('');
@@ -419,20 +609,6 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
 
   const handleTemplateClick = (template: SetupTemplate) => {
     handleSubmit(template.prompt);
-  };
-
-  const stateColors: Record<SessionState, string> = {
-    Idle: 'bg-emerald-500',
-    Listening: 'bg-red-500',
-    Acting: 'bg-amber-500',
-    Talking: 'bg-blue-500'
-  };
-
-  const stateGlows: Record<SessionState, string> = {
-    Idle: 'glow-emerald',
-    Listening: 'glow-red',
-    Acting: 'glow-amber',
-    Talking: 'glow-blue'
   };
 
   return (
@@ -465,302 +641,284 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
       </AnimatePresence>
 
       <div
-        className="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-3"
-        onMouseEnter={() => setClickThrough(false)}
-        onMouseLeave={() => setClickThrough(true)}
+        className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-3"
+        onMouseEnter={() => setIsHoveringWidget(true)}
+        onMouseLeave={() => setIsHoveringWidget(false)}
       >
-        <AnimatePresence>
-          {isOpen && (
+        <AnimatePresence mode="popLayout">
+          {(state === 'Listening' || state === 'Talking') && (
             <motion.div
-              initial={{ opacity: 0, scale: 0.92, y: 20 }}
+              layout
+              key="transcript"
+              initial={{ opacity: 0, scale: 0.9, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.92, y: 20 }}
-              transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-              className="w-[400px] bg-zinc-950 border border-zinc-800/60 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
-              style={{ maxHeight: 'min(600px, calc(100vh - 120px))' }}
+              exit={{ opacity: 0, scale: 0.8, y: -20, filter: 'blur(4px)' }}
+              transition={{ duration: 0.4, ease: "easeOut" }}
+              className="w-72 max-h-[50vh] flex flex-col p-5 rounded-3xl bg-zinc-900/60 backdrop-blur-2xl border border-white/10 shadow-2xl"
             >
-              {/* Header */}
-              <div className="px-4 py-3 border-b border-zinc-800/50 flex items-center justify-between bg-zinc-900/80 backdrop-blur-xl shrink-0">
-                <div className="flex items-center gap-2.5">
-                  <div className={`w-2 h-2 rounded-full ${state === 'Listening' ? 'bg-red-500 animate-pulse' :
-                    state === 'Acting' ? 'bg-amber-500' :
-                      state === 'Talking' ? 'bg-blue-500 animate-bounce' : 'bg-emerald-500'
-                    }`} />
-                  <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-zinc-400">
-                    Omni // {state}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {isCapturing && <Camera size={13} className="text-emerald-400 animate-pulse" />}
-                  {isSpeaking && <Volume2 size={13} className="text-blue-400 animate-pulse" />}
-                  <button onClick={() => setIsOpen(false)} className="p-1 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="Minimize">
-                    <X size={14} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      const api = (window as any).omniAPI;
-                      if (api?.quitApp) {
-                        api.quitApp();
-                      } else {
-                        window.close();
-                      }
-                    }}
-                    className="p-1 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all"
-                    title="Quit Omni"
-                  >
-                    <Power size={14} />
-                  </button>
-                </div>
-              </div>
-
-              {/* Mode Toggle */}
-              <div className="px-3 py-2 bg-zinc-950 border-b border-zinc-800/30 flex gap-2 shrink-0">
+              <div className="flex justify-between items-center mb-3">
+                <span className="text-xs font-semibold text-white/50 tracking-wider uppercase">
+                  {state === 'Talking' ? 'Thinking..' : (isListening ? 'Listening..' : 'Review')}
+                </span>
                 <button
-                  onClick={() => setMode('Active')}
-                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${mode === 'Active'
-                    ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20'
-                    : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
-                    }`}
+                  onClick={() => {
+                    explicitStopRef.current = true;
+                    stopListening();
+                    setState('Idle');
+                    setInputText('');
+                    setStatusText('');
+                    setLastUserTranscript('');
+                    setCurrentResponse(null);
+                    setDisplayedText('');
+                    setIsTypingResponse(false);
+                    setDebugEvents([]);
+                  }}
+                  className="p-1.5 rounded-full hover:bg-white/10 text-white/40 hover:text-white transition-colors"
                 >
-                  <Zap size={11} /> Active
-                </button>
-                <button
-                  onClick={() => setMode('Passive')}
-                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${mode === 'Passive'
-                    ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20'
-                    : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
-                    }`}
-                >
-                  <Eye size={11} /> Passive
+                  <X size={14} />
                 </button>
               </div>
 
-              {/* Chat Content */}
-              <div className="flex-1 overflow-y-auto custom-scrollbar">
-                {messages.length === 0 ? (
-                  // Empty state — show templates
-                  <div className="p-4 space-y-4">
-                    <div className="text-center py-4">
-                      <div className="inline-flex p-3 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-blue-500/10 mb-3">
-                        <MessageSquare className="text-emerald-500" size={24} />
-                      </div>
-                      <p className="text-sm font-semibold text-zinc-300">What would you like to set up?</p>
-                      <p className="text-[11px] text-zinc-600 mt-1">Choose a template or type your question</p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      {TEMPLATES.map(template => (
-                        <motion.button
-                          key={template.id}
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          onClick={() => handleTemplateClick(template)}
-                          className="p-3 rounded-xl text-left bg-zinc-900/50 border border-zinc-800/50 hover:border-emerald-500/30 hover:bg-zinc-800/50 transition-all group"
-                        >
-                          <div className="flex items-center gap-2 mb-1.5">
-                            <div className="text-zinc-500 group-hover:text-emerald-400 transition-colors">
-                              {TEMPLATE_ICONS[template.icon] || <Code2 size={16} />}
-                            </div>
-                            <span className="text-xs font-bold text-zinc-300 group-hover:text-white transition-colors">
-                              {template.label}
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-zinc-600 leading-relaxed">
-                            {template.description}
-                          </p>
-                        </motion.button>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  // Chat thread
-                  <div className="p-4 space-y-4">
-                    {messages.map((msg, idx) => (
-                      <motion.div
-                        key={msg.id}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.3 }}
-                        className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                      >
-                        {msg.role === 'user' ? (
-                          // User message
-                          <div className="max-w-[85%] bg-emerald-600/20 border border-emerald-500/20 rounded-2xl rounded-br-sm px-3.5 py-2.5">
-                            <p className="text-sm text-emerald-100 leading-relaxed">{msg.content}</p>
-                            <p className="text-[9px] text-emerald-500/50 mt-1 text-right">
-                              {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                            </p>
-                          </div>
-                        ) : (
-                          // Assistant message
-                          <div className="max-w-[90%] space-y-3">
-                            <div className="bg-zinc-900/60 border border-zinc-800/50 rounded-2xl rounded-bl-sm px-3.5 py-2.5">
-                              <div className="prose prose-invert prose-sm max-w-none text-[13px] leading-relaxed">
-                                <ReactMarkdown>
-                                  {idx === messages.length - 1 && isTypingResponse
-                                    ? displayedText
-                                    : msg.content
-                                  }
-                                </ReactMarkdown>
-                                {idx === messages.length - 1 && isTypingResponse && (
-                                  <span className="typing-cursor" />
-                                )}
-                              </div>
-                              <p className="text-[9px] text-zinc-700 mt-1">
-                                {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                              </p>
-                            </div>
-
-                            {/* Action steps */}
-                            {msg.actions && msg.actions.length > 0 && !isTypingResponse && (
-                              <motion.div
-                                initial={{ opacity: 0, y: 10 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: 0.2 }}
-                                className="space-y-2"
-                              >
-                                <div className="flex items-center gap-2 px-1">
-                                  <CircleDot size={10} className="text-zinc-600" />
-                                  <span className="text-[10px] font-bold text-zinc-600 uppercase tracking-wider">
-                                    {msg.actions.length} Actions Planned
-                                  </span>
-                                </div>
-                                {msg.actions.map((action, aidx) => (
-                                  <motion.div
-                                    key={aidx}
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    transition={{ delay: 0.1 * aidx }}
-                                    className={`p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${currentActionIndex === aidx
-                                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                                      : currentActionIndex > aidx
-                                        ? 'bg-zinc-800/30 border-zinc-700/50 text-zinc-500'
-                                        : 'bg-zinc-900/40 border-zinc-800/50 text-zinc-300'
-                                      }`}
-                                  >
-                                    {currentActionIndex > aidx ? (
-                                      <CheckCircle2 size={14} className="text-emerald-500 shrink-0 mt-0.5" />
-                                    ) : currentActionIndex === aidx ? (
-                                      <Loader2 size={14} className="animate-spin shrink-0 mt-0.5" />
-                                    ) : (
-                                      <div className="w-3.5 h-3.5 rounded-full border-2 border-zinc-700 shrink-0 mt-0.5" />
-                                    )}
-                                    <div className="flex-1 min-w-0">
-                                      <p className="text-[12px] font-medium leading-snug">{action.description}</p>
-                                      <p className="text-[9px] font-mono opacity-40 mt-0.5 uppercase">
-                                        {action.type}{action.value ? ` → ${action.value}` : ''}
-                                      </p>
-                                    </div>
-                                  </motion.div>
-                                ))}
-
-                                {/* Execute / Guide button */}
-                                {state !== 'Acting' && currentActionIndex === -1 && (
-                                  <motion.button
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    onClick={runActions}
-                                    className="w-full py-2.5 bg-zinc-100 hover:bg-white text-zinc-900 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
-                                  >
-                                    <Play size={16} fill="currentColor" />
-                                    {mode === 'Active' ? 'Execute Setup' : 'Start Guidance'}
-                                  </motion.button>
-                                )}
-                              </motion.div>
-                            )}
-                          </div>
-                        )}
-                      </motion.div>
+              <div className="flex-1 overflow-y-auto min-h-[40px] custom-scrollbar pr-1 select-text">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={state === 'Talking' ? lastUserTranscript : inputText}
+                  onChange={(e) => {
+                    userEditedRef.current = true;
+                    setInputText(e.target.value);
+                    setLastUserTranscript(e.target.value);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      explicitStopRef.current = true;
+                      const current = (e.currentTarget as HTMLInputElement).value;
+                      if (current.trim()) handleSubmit(current);
+                    }
+                  }}
+                  placeholder="Ask something..."
+                  className="w-full bg-transparent outline-none text-[14px] text-white/90 font-medium leading-relaxed break-words placeholder:text-white/30"
+                  disabled={state === 'Acting'}
+                />
+                {statusText && (
+                  <p className="mt-2 text-[11px] text-amber-300/80 font-medium leading-relaxed break-words whitespace-pre-wrap">
+                    {statusText}
+                  </p>
+                )}
+                {DEBUG_OVERLAY && debugEvents.length > 0 && (
+                  <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                    {debugEvents.slice(0, 4).map((e, idx) => (
+                      <p key={idx} className="text-[10px] text-white/40 font-medium leading-relaxed break-words whitespace-pre-wrap">
+                        {e}
+                      </p>
                     ))}
-
-                    {/* Loading state */}
-                    {state === 'Talking' && (
-                      <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="flex justify-start"
-                      >
-                        <div className="bg-zinc-900/60 border border-zinc-800/50 rounded-2xl rounded-bl-sm px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader2 className="animate-spin text-emerald-500" size={16} />
-                            <span className="text-xs text-zinc-400 animate-pulse">Analyzing your environment...</span>
-                          </div>
-                        </div>
-                      </motion.div>
-                    )}
-
-                    <div ref={chatEndRef} />
                   </div>
                 )}
               </div>
 
-              {/* Input Bar */}
-              <div className="p-3 border-t border-zinc-800/30 bg-zinc-900/50 backdrop-blur-xl shrink-0">
+              {state === 'Listening' && inputText.trim().length > 0 && !isListening && (
+                <div className="flex justify-end mt-4">
+                  <button
+                    onClick={() => {
+                      explicitStopRef.current = true;
+                      handleSubmit(inputText);
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-white font-medium text-sm transition-colors shadow-lg shadow-emerald-500/20"
+                  >
+                    <span>Send</span>
+                    <Send size={14} />
+                  </button>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {state === 'Talking' && (
+            <motion.div
+              layout
+              key="thinking"
+              initial={{ opacity: 0, scale: 0.9, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.8, y: -20 }}
+              transition={{ duration: 0.3 }}
+              className="px-5 py-3 rounded-full bg-zinc-900/60 backdrop-blur-2xl border border-white/10 shadow-2xl flex items-center gap-3"
+            >
+              <Brain className="text-blue-400 animate-pulse" size={16} />
+              <div className="flex gap-1" style={{ paddingTop: '2px' }}>
+                <motion.div animate={{ y: [0, -4, 0] }} transition={{ duration: 0.6, repeat: Infinity, delay: 0 }} className="w-1.5 h-1.5 bg-blue-400 rounded-full" />
+                <motion.div animate={{ y: [0, -4, 0] }} transition={{ duration: 0.6, repeat: Infinity, delay: 0.2 }} className="w-1.5 h-1.5 bg-blue-400 rounded-full" />
+                <motion.div animate={{ y: [0, -4, 0] }} transition={{ duration: 0.6, repeat: Infinity, delay: 0.4 }} className="w-1.5 h-1.5 bg-blue-400 rounded-full" />
+              </div>
+              <span className="text-xs text-white/70 font-medium tracking-wide">Thinking...</span>
+            </motion.div>
+          )}
+
+          {(state === 'Responding' || state === 'Acting') && currentResponse && (
+            <motion.div
+              layout
+              key="response"
+              initial={{ opacity: 0, scale: 0.9, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.8, y: -20, filter: 'blur(4px)' }}
+              transition={{ duration: 0.4, ease: 'easeOut' }}
+              className="w-80 max-h-[60vh] flex flex-col p-5 rounded-3xl bg-zinc-900/70 backdrop-blur-2xl border border-emerald-500/20 shadow-[0_0_40px_rgba(16,185,129,0.15)]"
+            >
+              <div className="flex justify-between items-center mb-3">
                 <div className="flex items-center gap-2">
-                  {/* Voice button */}
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={isListening ? stopListening : startListening}
-                    className={`p-2.5 rounded-xl transition-all shrink-0 ${isListening
-                      ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                      : 'bg-zinc-800 text-zinc-400 hover:text-emerald-400 hover:bg-zinc-700 border border-transparent'
-                      }`}
-                  >
-                    {isListening ? <Square size={16} fill="currentColor" /> : <Mic size={16} />}
-                  </motion.button>
+                  <Brain className="text-emerald-400" size={14} />
+                  <span className="text-xs font-semibold text-emerald-400/80 tracking-wider uppercase">Omni Response</span>
+                </div>
+                <button
+                  onClick={() => {
+                    setState('Idle');
+                    setCurrentResponse(null);
+                    setDisplayedText('');
+                    setIsTypingResponse(false);
+                    setStatusText('');
+                  }}
+                  className="p-1.5 rounded-full hover:bg-white/10 text-white/40 hover:text-white transition-colors"
+                >
+                  <X size={14} />
+                </button>
+              </div>
 
-                  {/* Text input */}
-                  <input
-                    ref={inputRef}
-                    type="text"
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-                    placeholder={isListening ? 'Listening...' : 'Ask about any setup...'}
-                    className="flex-1 bg-zinc-800/50 border border-zinc-700/50 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/30 focus:bg-zinc-800 transition-all"
-                    disabled={state === 'Talking' || state === 'Acting'}
-                  />
+              <div className="flex-1 overflow-y-auto min-h-[80px] max-h-[42vh] custom-scrollbar pr-1 select-text">
+                <div className="space-y-2">
+                  {messages.slice(-12).map((m) => (
+                    <div
+                      key={m.id}
+                      className={
+                        m.role === 'user'
+                          ? 'ml-6 rounded-2xl px-3 py-2 bg-white/5 border border-white/10'
+                          : 'mr-6 rounded-2xl px-3 py-2 bg-emerald-500/5 border border-emerald-500/15'
+                      }
+                    >
+                      <div className="text-[10px] uppercase tracking-wider text-white/40 font-semibold mb-1">
+                        {m.role === 'user' ? 'You' : 'Omni'}
+                      </div>
+                      <div className="text-[13px] text-white/85 font-medium leading-relaxed break-words whitespace-pre-wrap">
+                        {m.role === 'assistant' ? <ReactMarkdown>{m.content}</ReactMarkdown> : m.content}
+                      </div>
+                    </div>
+                  ))}
 
-                  {/* Send button */}
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => handleSubmit()}
-                    disabled={!inputText.trim() || state === 'Talking' || state === 'Acting'}
-                    className="p-2.5 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 disabled:bg-zinc-800 disabled:text-zinc-600 transition-all shrink-0"
-                  >
-                    <Send size={16} />
-                  </motion.button>
+                  {isTypingResponse && (
+                    <div className="mr-6 rounded-2xl px-3 py-2 bg-emerald-500/5 border border-emerald-500/15">
+                      <div className="text-[10px] uppercase tracking-wider text-white/40 font-semibold mb-1">Omni</div>
+                      <div className="text-[13px] text-white/85 font-medium leading-relaxed break-words whitespace-pre-wrap">
+                        {displayedText}<span className="typing-cursor" />
+                      </div>
+                    </div>
+                  )}
+
+                  <div ref={chatEndRef} />
                 </div>
               </div>
+
+              {ALLOW_AUTOMATION && currentResponse.actions.length > 0 && !isTypingResponse && (
+                <div className="mt-3 pt-3 border-t border-white/5">
+                  <div className="flex items-center gap-2">
+                    <Zap className="text-amber-400" size={12} />
+                    <span className="text-[11px] text-amber-400/70 font-medium">{currentResponse.actions.length} action{currentResponse.actions.length > 1 ? 's' : ''} queued</span>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {state === 'Acting' && (
+            <motion.div
+              layout
+              key="acting"
+              initial={{ opacity: 0, scale: 0.9, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.8, y: -20 }}
+              className="max-w-[300px] px-5 py-3 rounded-full bg-amber-500/10 backdrop-blur-2xl border border-amber-500/30 shadow-[0_0_30px_rgba(245,158,11,0.2)] flex items-center gap-3"
+            >
+              <Loader2 className="animate-spin text-amber-500 shrink-0" size={14} />
+              <span className="text-xs text-amber-500/90 font-medium truncate">{currentActionDesc || 'Executing...'}</span>
             </motion.div>
           )}
         </AnimatePresence>
 
-        {/* The Floating Bubble */}
         <motion.button
-          whileHover={{ scale: 1.08 }}
-          whileTap={{ scale: 0.92 }}
-          onClick={() => setIsOpen(!isOpen)}
-          className={`w-14 h-14 rounded-full shadow-2xl flex items-center justify-center transition-all duration-500 relative group ${stateColors[state]} ${stateGlows[state]}`}
+          layout
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          animate={state === 'Listening' ? { scale: 1.05 } : { scale: 1 }}
+          onClick={() => {
+            if (isListening) {
+              // First click while recording: stop and process
+              autoSubmitRef.current = false;
+              stopListening();
+            } else if (state === 'Listening') {
+              // We are in listening/review state but not recording: submit
+              if (inputText.trim()) handleSubmit(inputText);
+            } else if (state === 'Responding') {
+              // Follow-up question in the same chat: start a new recording
+              startListening();
+            } else if (state === 'Talking' || state === 'Acting') {
+              setStatusText('Busy. Please wait...');
+            } else if (state === 'Idle') {
+              startListening();
+            }
+          }}
+          className={`flex items-center gap-2.5 px-4 h-11 rounded-full shadow-2xl transition-all duration-300 backdrop-blur-2xl border relative group z-50 ${state === 'Listening'
+            ? 'bg-zinc-900/80 border-blue-500/50 shadow-[0_0_30px_rgba(59,130,246,0.2)]'
+            : state === 'Acting'
+              ? 'bg-zinc-900/80 border-amber-500/50 shadow-[0_0_30px_rgba(245,158,11,0.2)]'
+              : state === 'Talking'
+                ? 'bg-zinc-900/80 border-blue-500/50 shadow-[0_0_30px_rgba(59,130,246,0.2)]'
+                : state === 'Responding'
+                  ? 'bg-zinc-900/80 border-emerald-500/50 shadow-[0_0_30px_rgba(16,185,129,0.2)]'
+                  : 'bg-zinc-900/60 border-zinc-700/50 hover:bg-zinc-800/80 hover:border-white/20 hover:shadow-[0_0_20px_rgba(255,255,255,0.05)]'
+            }`}
         >
-          <div className="absolute inset-0 rounded-full bg-inherit animate-ping opacity-15 group-hover:opacity-30" />
-          <AnimatePresence mode="wait">
-            {isOpen ? (
-              <motion.div key="close" initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} exit={{ rotate: 90, opacity: 0 }}>
-                <X className="text-white" size={22} />
-              </motion.div>
-            ) : state === 'Listening' ? (
-              <motion.div key="stop" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                <Square fill="white" className="text-white" size={20} />
-              </motion.div>
-            ) : (
-              <motion.div key="mic" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                <MessageSquare className="text-white" size={22} />
-              </motion.div>
-            )}
-          </AnimatePresence>
+          <div className="relative w-4 h-4 flex items-center justify-center">
+            <AnimatePresence mode="wait">
+              {state !== 'Listening' ? (
+                <motion.div
+                  key="mic"
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.5 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute inset-0 flex items-center justify-center"
+                >
+                  <Mic className="text-white/80 group-hover:text-white transition-colors" size={16} />
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="viz"
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.5 }}
+                  className="absolute inset-0 flex items-center justify-center gap-[2px] h-3.5"
+                >
+                  {[
+                    ['30%', '90%', '40%', '100%', '30%'],
+                    ['40%', '100%', '20%', '80%', '40%'],
+                    ['50%', '80%', '40%', '100%', '50%'],
+                    ['20%', '100%', '50%', '80%', '20%']
+                  ].map((heights, i) => (
+                    <motion.div
+                      key={i}
+                      animate={{ height: heights }}
+                      transition={{
+                        duration: 1.5 + i * 0.3,
+                        repeat: Infinity,
+                        repeatType: 'reverse',
+                        ease: "easeInOut"
+                      }}
+                      className="w-[2px] rounded-full bg-blue-400"
+                    />
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+          <span className="text-[13px] font-semibold text-white/90 tracking-wide">Omni</span>
         </motion.button>
       </div>
     </>
