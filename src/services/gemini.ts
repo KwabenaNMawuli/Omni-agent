@@ -31,15 +31,200 @@ async function generateWithFallback(args: {
 
 function getAI(): GoogleGenAI {
   if (!_ai) {
-    const key = process.env.GEMINI_API_KEY;
+    // In Vite renderer builds, env vars are available via import.meta.env.
+    // We also support the string define() shim (process.env.GEMINI_API_KEY) for compatibility.
+    const key =
+      (import.meta as any)?.env?.GEMINI_API_KEY ||
+      (process.env as any)?.GEMINI_API_KEY;
     if (!key) {
       throw new Error(
         "GEMINI_API_KEY is not set. Create a .env.local file with GEMINI_API_KEY=your_key"
       );
     }
-    _ai = new GoogleGenAI({ apiKey: key });
+    // Ensure the underlying websocket URL is well-formed in Electron builds.
+    _ai = new GoogleGenAI({ apiKey: key, baseUrl: 'https://generativelanguage.googleapis.com' } as any);
   }
   return _ai;
+}
+
+export type LiveAgentEvent =
+  | { type: 'connected' }
+  | { type: 'disconnected' }
+  | { type: 'interrupted' }
+  | { type: 'text'; text: string }
+  | { type: 'audio'; mimeType: string; data: string }
+  | { type: 'error'; message: string };
+
+export interface LiveAgentSession {
+  connect: () => Promise<void>;
+  disconnect: () => Promise<void>;
+  sendText: (text: string, turnComplete?: boolean) => Promise<void>;
+  sendAudioChunk: (pcm16Base64: string, mimeType?: string) => Promise<void>;
+  interrupt: () => Promise<void>;
+  onEvent: (handler: (e: LiveAgentEvent) => void) => () => void;
+  getState: () => { connected: boolean };
+}
+
+export function createLiveAgentSession(args?: {
+  model?: string;
+  responseModalities?: Array<'AUDIO' | 'TEXT'>;
+}): LiveAgentSession {
+  const model = args?.model || 'gemini-2.0-flash-live-preview-04-09';
+  const responseModalities = args?.responseModalities || ['AUDIO'];
+
+  let connected = false;
+  let session: any = null;
+  let readerTask: Promise<void> | null = null;
+  const handlers = new Set<(e: LiveAgentEvent) => void>();
+
+  const emit = (e: LiveAgentEvent) => {
+    for (const h of handlers) h(e);
+  };
+
+  const connect = async () => {
+    if (connected) return;
+    try {
+      // Protect against a hung websocket connect by using an AbortController timeout.
+      const abortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timeoutMs = 15000;
+      const timeout = setTimeout(() => abortController?.abort(), timeoutMs);
+      try {
+        session = await (getAI() as any).live.connect({
+          model,
+          config: {
+            responseModalities,
+            inputAudioFormat: {
+              mimeType: 'audio/pcm;rate=16000',
+            },
+            outputAudioFormat: {
+              mimeType: 'audio/pcm;rate=24000',
+            },
+          },
+          ...(abortController ? { signal: abortController.signal } : {}),
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+      connected = true;
+      emit({ type: 'connected' });
+
+      readerTask = (async () => {
+        try {
+          for await (const message of session) {
+            const sc = message?.serverContent;
+            if (sc?.interrupted) {
+              emit({ type: 'interrupted' });
+              continue;
+            }
+
+            const parts = sc?.modelTurn?.parts || sc?.parts || [];
+            for (const p of parts) {
+              if (typeof p?.text === 'string' && p.text.trim()) {
+                emit({ type: 'text', text: p.text });
+              }
+              const inline = p?.inlineData;
+              if (inline?.data && inline?.mimeType) {
+                emit({ type: 'audio', mimeType: inline.mimeType, data: inline.data });
+              }
+            }
+          }
+          // Iterator ended -> treat as disconnected
+          if (connected) {
+            connected = false;
+            emit({ type: 'disconnected' });
+          }
+        } catch (e: any) {
+          if (connected) {
+            connected = false;
+            emit({ type: 'disconnected' });
+          }
+          const msg = e?.name === 'AbortError'
+            ? 'Live connect timed out (15s). Check GEMINI_API_KEY, network, and model id.'
+            : (e?.message || String(e));
+          emit({ type: 'error', message: msg });
+        }
+      })();
+    } catch (e: any) {
+      const msg = e?.name === 'AbortError'
+        ? 'Live connect timed out (15s). Check GEMINI_API_KEY, network, and model id.'
+        : (e?.message || String(e));
+      emit({ type: 'error', message: msg });
+      throw e;
+    }
+  };
+
+  const disconnect = async () => {
+    if (!connected) return;
+    try {
+      connected = false;
+      try {
+        await session?.close?.();
+      } catch (_) {}
+      session = null;
+      emit({ type: 'disconnected' });
+      await readerTask;
+    } finally {
+      readerTask = null;
+    }
+  };
+
+  const sendText = async (text: string, turnComplete: boolean = true) => {
+    if (!connected || !session) throw new Error('Live session is not connected');
+    await session.sendClientContent({ turns: text, turnComplete });
+  };
+
+  const sendAudioChunk = async (pcm16Base64: string, mimeType: string = 'audio/pcm;rate=16000') => {
+    if (!connected || !session) throw new Error('Live session is not connected');
+    // @google/genai live sessions accept client content with inlineData parts.
+    // We send raw PCM16 mono 16kHz frames as base64.
+    try {
+      await session.sendClientContent({
+        turns: [
+          {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: pcm16Base64,
+                },
+              },
+            ],
+          },
+        ],
+        turnComplete: false,
+      });
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (msg.toLowerCase().includes('websocket') || msg.toLowerCase().includes('closed')) {
+        connected = false;
+        emit({ type: 'disconnected' });
+      }
+      throw e;
+    }
+  };
+
+  const interrupt = async () => {
+    if (!connected || !session) return;
+    try {
+      await session.sendClientContent({ turns: ' ', turnComplete: true });
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (msg.toLowerCase().includes('websocket') || msg.toLowerCase().includes('closed')) {
+        connected = false;
+        emit({ type: 'disconnected' });
+      }
+      throw e;
+    }
+  };
+
+  const onEvent = (handler: (e: LiveAgentEvent) => void) => {
+    handlers.add(handler);
+    return () => handlers.delete(handler);
+  };
+
+  const getState = () => ({ connected });
+
+  return { connect, disconnect, sendText, sendAudioChunk, interrupt, onEvent, getState };
 }
 
 /**
