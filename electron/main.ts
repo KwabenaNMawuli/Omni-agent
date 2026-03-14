@@ -32,12 +32,23 @@ function createWindow() {
         resizable: false,
         skipTaskbar: true,
         hasShadow: false,
+        focusable: false,
+        titleBarStyle: 'hidden',
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
             nodeIntegration: false,
-        },
+        }
     });
+
+    mainWindow.setMenu(null);
+    // CRITICAL: make window un-focusable AFTER creation to prevent focus stealing without triggering the white titlebar bug
+    mainWindow.setFocusable(false);
+
+    // Ensure it sits above absolutely everything, including fullscreen apps
+    // Removed 'screen-saver' setting because on Windows this forces the native white title bar to reappear
+    mainWindow.setAlwaysOnTop(true);
+    mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
     // In development, load from Vite dev server
     if (process.env.NODE_ENV === 'development') {
@@ -71,6 +82,20 @@ ipcMain.on('set-ignore-mouse-events', (_event, ignore: boolean, opts?: { forward
     }
 });
 
+// Allow the renderer to temporarily make the window focusable.
+// Needed for Web Speech API (SpeechRecognition) which often fails in unfocusable windows.
+ipcMain.handle('window:set-focusable', (_event, focusable: boolean) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    try {
+        mainWindow.setFocusable(!!focusable);
+        if (focusable) {
+            mainWindow.showInactive();
+        }
+    } catch (e) {
+        console.warn('Failed to set window focusable:', e);
+    }
+});
+
 // Quit the app
 ipcMain.on('app:quit', () => {
     app.quit();
@@ -81,12 +106,7 @@ ipcMain.on('app:quit', () => {
 // Capture current screen — hides the overlay first so the AI never sees its own UI
 ipcMain.handle('screen:capture', async () => {
     try {
-        // Hide the overlay so it doesn't appear in the screenshot
-        if (mainWindow && mainWindow.isVisible()) {
-            mainWindow.hide();
-            // Small delay to ensure the OS finishes removing the window from the compositor
-            await new Promise(r => setTimeout(r, 150));
-        }
+        // We no longer hide the overlay during screen capture so it stays visible
 
         const primaryDisplay = screen.getPrimaryDisplay();
         const { width, height } = primaryDisplay.size;
@@ -95,13 +115,7 @@ ipcMain.handle('screen:capture', async () => {
             thumbnailSize: { width, height } // Match actual screen resolution
         });
 
-        // Show the overlay again — use showInactive() to avoid stealing focus
-        // from the terminal or app the user is watching
-        if (mainWindow) {
-            mainWindow.showInactive();
-            mainWindow.setAlwaysOnTop(true);
-            mainWindow.setIgnoreMouseEvents(true, { forward: true });
-        }
+        // No need to restore overlay visibility
 
         if (sources.length > 0) {
             const screenshot = sources[0].thumbnail.toDataURL();
@@ -120,12 +134,7 @@ ipcMain.handle('screen:capture', async () => {
         return null;
     } catch (error) {
         console.error('Screen capture error:', error);
-        // Ensure overlay is re-shown even on error
-        if (mainWindow) {
-            mainWindow.showInactive();
-            mainWindow.setAlwaysOnTop(true);
-            mainWindow.setIgnoreMouseEvents(true, { forward: true });
-        }
+        // Error handling fallback
         return null;
     }
 });
@@ -164,29 +173,20 @@ ipcMain.handle('action:execute', async (_event, action) => {
  */
 ipcMain.handle('action:wait-for-stable', async (_event, opts?: { timeoutMs?: number; intervalMs?: number }) => {
     const timeout = opts?.timeoutMs ?? 15000;  // Default 15s max wait
-    const interval = opts?.intervalMs ?? 800;  // Check every 800ms
+    const interval = opts?.intervalMs ?? 1500;  // Increased to 1500ms to reduce CPU load and mouse stutter
     const startTime = Date.now();
     let previousDataUrl: string | null = null;
 
     while (Date.now() - startTime < timeout) {
         try {
-            // Hide the overlay so its animations don't contaminate the comparison
-            if (mainWindow && mainWindow.isVisible()) {
-                mainWindow.hide();
-                await new Promise(r => setTimeout(r, 80));
-            }
+            // We no longer hide the overlay during wait-for-stable
 
             const sources = await desktopCapturer.getSources({
                 types: ['screen'],
                 thumbnailSize: { width: 480, height: 270 } // Low-res for fast comparison
             });
 
-            // Re-show overlay without stealing focus
-            if (mainWindow) {
-                mainWindow.showInactive();
-                mainWindow.setAlwaysOnTop(true);
-                mainWindow.setIgnoreMouseEvents(true, { forward: true });
-            }
+            // No need to restore overlay
 
             if (sources.length > 0) {
                 const currentDataUrl = sources[0].thumbnail.toDataURL();
@@ -198,12 +198,7 @@ ipcMain.handle('action:wait-for-stable', async (_event, opts?: { timeoutMs?: num
                 previousDataUrl = currentDataUrl;
             }
         } catch {
-            // Ensure overlay is re-shown even on error
-            if (mainWindow) {
-                mainWindow.showInactive();
-                mainWindow.setAlwaysOnTop(true);
-                mainWindow.setIgnoreMouseEvents(true, { forward: true });
-            }
+            // Error handling fallback
         }
 
         await new Promise(r => setTimeout(r, interval));
@@ -238,7 +233,17 @@ ipcMain.handle('system:screen-dimensions', () => {
 });
 
 // ── App Lifecycle ──
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+    createWindow();
+
+    // Aggressively enforce always-on-top so the overlay correctly floats over
+    // heavy IDEs, Chrome, and exclusive fullscreen apps on Windows architectures.
+    setInterval(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.setAlwaysOnTop(true);
+        }
+    }, 1500);
+});
 
 app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') {
@@ -253,52 +258,4 @@ app.on('activate', () => {
 });
 
 // ── Background Screenshot Capture ──
-// Periodic fallback capture every 5 seconds (Phase 3 of spec)
-let captureInterval: NodeJS.Timeout;
-
-app.on('ready', () => {
-    captureInterval = setInterval(async () => {
-        if (sessionController.getState() !== 'Idle') return; // Only capture when idle
-
-        try {
-            // Hide overlay so background captures are clean
-            if (mainWindow && mainWindow.isVisible()) {
-                mainWindow.hide();
-                await new Promise(r => setTimeout(r, 100));
-            }
-
-            const sources = await desktopCapturer.getSources({
-                types: ['screen'],
-                thumbnailSize: { width: 960, height: 540 } // Lower res for background
-            });
-
-            // Re-show overlay without stealing focus
-            if (mainWindow) {
-                mainWindow.showInactive();
-                mainWindow.setAlwaysOnTop(true);
-                mainWindow.setIgnoreMouseEvents(true, { forward: true });
-            }
-
-            if (sources.length > 0) {
-                visualMemory.addFrame({
-                    image: sources[0].thumbnail.toDataURL(),
-                    timestamp: new Date().toISOString(),
-                    appName: 'Desktop',
-                    windowTitle: sources[0].name,
-                    index: visualMemory.getNextIndex(),
-                });
-            }
-        } catch (e) {
-            // Ensure overlay is re-shown even on error
-            if (mainWindow) {
-                mainWindow.showInactive();
-                mainWindow.setAlwaysOnTop(true);
-                mainWindow.setIgnoreMouseEvents(true, { forward: true });
-            }
-        }
-    }, 10000);
-});
-
-app.on('before-quit', () => {
-    clearInterval(captureInterval);
-});
+// Removed per instruction to eliminate startup load and intermittent captures.

@@ -22,54 +22,53 @@ import {
   ArrowRight,
   Sparkles,
   CircleDot,
-  Power
+  Power,
+  Brain
 } from 'lucide-react';
-import { getSetupInstructions, generateSpeech } from '../services/gemini';
+import { createLiveAgentSession, getSetupInstructions, generateSpeech } from '../services/gemini';
 import { SetupAction, GeminiResponse, AgentMode, Point, ChatMessage, SessionState, SetupTemplate } from '../types';
 import ReactMarkdown from 'react-markdown';
 import confetti from 'canvas-confetti';
 import VisualOverlay from './VisualOverlay';
 import html2canvas from 'html2canvas';
 
+function floatTo16BitPCM(input: Float32Array): Int16Array {
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+}
+
+function resampleTo16kHzMono(input: Float32Array, inputSampleRate: number): Float32Array {
+  if (inputSampleRate === 16000) return input;
+  const ratio = inputSampleRate / 16000;
+  const newLength = Math.max(1, Math.round(input.length / ratio));
+  const output = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const idx = i * ratio;
+    const idx0 = Math.floor(idx);
+    const idx1 = Math.min(input.length - 1, idx0 + 1);
+    const t = idx - idx0;
+    output[i] = input[idx0] * (1 - t) + input[idx1] * t;
+  }
+  return output;
+}
+
+function arrayBufferToBase64(buffer: ArrayBufferLike): string {
+  let binary = '';
+  const ab = buffer instanceof ArrayBuffer ? buffer : buffer.slice(0);
+  const bytes = new Uint8Array(ab);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
 // Pre-built setup templates
-const TEMPLATES: SetupTemplate[] = [
-  {
-    id: 'nodejs', label: 'Node.js',
-    description: 'Install Node.js and npm',
-    prompt: 'Help me install Node.js and npm on my system. I am a complete beginner.',
-    icon: 'Braces', category: 'runtime', difficulty: 'beginner'
-  },
-  {
-    id: 'python', label: 'Python',
-    description: 'Set up Python with pip',
-    prompt: 'Help me install Python and set up pip on my system. I have never done this before.',
-    icon: 'Code2', category: 'runtime', difficulty: 'beginner'
-  },
-  {
-    id: 'git', label: 'Git',
-    description: 'Install and configure Git',
-    prompt: 'Help me install Git and set up my name and email for version control.',
-    icon: 'GitBranch', category: 'tool', difficulty: 'beginner'
-  },
-  {
-    id: 'vscode', label: 'VS Code',
-    description: 'Set up VS Code with extensions',
-    prompt: 'Help me install Visual Studio Code and recommend essential extensions for web development.',
-    icon: 'Terminal', category: 'tool', difficulty: 'beginner'
-  },
-  {
-    id: 'java', label: 'Java + IntelliJ',
-    description: 'JDK and IntelliJ IDEA setup',
-    prompt: 'Help me install the Java Development Kit and set up IntelliJ IDEA for Java development.',
-    icon: 'Coffee', category: 'framework', difficulty: 'intermediate'
-  },
-  {
-    id: 'react', label: 'React Project',
-    description: 'Create a new React app',
-    prompt: 'Help me create a new React project with Vite and TypeScript.',
-    icon: 'Sparkles', category: 'framework', difficulty: 'beginner'
-  },
-];
+const TEMPLATES: SetupTemplate[] = [];
 
 const TEMPLATE_ICONS: Record<string, React.ReactNode> = {
   'Braces': <Braces size={16} />,
@@ -93,10 +92,31 @@ const setClickThrough = (ignore: boolean) => {
 };
 
 export default function OverlayWidget({ onAction }: { onAction: (action: SetupAction) => Promise<void> }) {
+  const DEBUG_OVERLAY = (import.meta as any)?.env?.VITE_OMNI_DEBUG === '1';
+  const ALLOW_AUTOMATION = (import.meta as any)?.env?.VITE_OMNI_AUTOMATION === '1';
+
+  const [useLiveAgent, setUseLiveAgent] = useState(true);
+  const liveSessionRef = useRef<ReturnType<typeof createLiveAgentSession> | null>(null);
+  const liveAudioRef = useRef<HTMLAudioElement | null>(null);
+  const liveAudioQueueRef = useRef<string[]>([]);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [sentChunks, setSentChunks] = useState(0);
+  const [receivedChunks, setReceivedChunks] = useState(0);
+
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const micActiveRef = useRef(false);
+
   const [state, setState] = useState<SessionState>('Idle');
   const [mode, setMode] = useState<AgentMode>('Active');
   const [isOpen, setIsOpen] = useState(false);
   const [inputText, setInputText] = useState('');
+  const [statusText, setStatusText] = useState('');
+  const [lastUserTranscript, setLastUserTranscript] = useState('');
+  const [debugEvents, setDebugEvents] = useState<string[]>([]);
+  const [isHoveringWidget, setIsHoveringWidget] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [currentResponse, setCurrentResponse] = useState<GeminiResponse | null>(null);
   const [currentActionIndex, setCurrentActionIndex] = useState(-1);
@@ -109,10 +129,147 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
   const [isTypingResponse, setIsTypingResponse] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const recognitionRef = useRef<any>(null);
-  const isListeningRef = useRef(false);
-  const transcriptRef = useRef('');
+
+  const stopLiveAudio = useCallback(() => {
+    try {
+      liveAudioQueueRef.current = [];
+      if (liveAudioRef.current) {
+        liveAudioRef.current.pause();
+        liveAudioRef.current.src = '';
+      }
+    } catch (_) {}
+  }, []);
+
+  const stopMicStreaming = useCallback(() => {
+    micActiveRef.current = false;
+    try {
+      if (processorNodeRef.current) {
+        processorNodeRef.current.onaudioprocess = null;
+        try { processorNodeRef.current.disconnect(); } catch (_) {}
+      }
+      if (sourceNodeRef.current) {
+        try { sourceNodeRef.current.disconnect(); } catch (_) {}
+      }
+      processorNodeRef.current = null;
+      sourceNodeRef.current = null;
+    } catch (_) {}
+
+    try {
+      if (audioCtxRef.current) {
+        const ctx = audioCtxRef.current;
+        audioCtxRef.current = null;
+        ctx.close().catch(() => {});
+      }
+    } catch (_) {}
+
+    try {
+      if (micStreamRef.current) {
+        micStreamRef.current.getTracks().forEach(t => {
+          try { t.stop(); } catch (_) {}
+        });
+      }
+    } catch (_) {}
+    micStreamRef.current = null;
+  }, []);
+
+  const resetToIdle = useCallback(async () => {
+    setStatusText('');
+    stopLiveAudio();
+    stopMicStreaming();
+    try { await liveSessionRef.current?.interrupt?.(); } catch (_) {}
+    try { await liveSessionRef.current?.disconnect?.(); } catch (_) {}
+    liveSessionRef.current = null;
+    setLiveConnected(false);
+    setSentChunks(0);
+    setReceivedChunks(0);
+    setIsListening(false);
+    setIsSpeaking(false);
+    setState('Idle');
+  }, [stopLiveAudio, stopMicStreaming]);
+
+  const startMicStreaming = useCallback(async () => {
+    if (micActiveRef.current) return;
+    if (!navigator?.mediaDevices?.getUserMedia) throw new Error('getUserMedia is not available');
+    if (!liveSessionRef.current) throw new Error('Live session not initialized');
+    if (!liveSessionRef.current.getState().connected) await liveSessionRef.current.connect();
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    micStreamRef.current = stream;
+    micActiveRef.current = true;
+
+    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+    const ctx: AudioContext = new AudioCtx();
+    audioCtxRef.current = ctx;
+    const source = ctx.createMediaStreamSource(stream);
+    sourceNodeRef.current = source;
+
+    // ScriptProcessor is deprecated but works well in Electron/Chromium for quick iteration.
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    processorNodeRef.current = processor;
+
+    processor.onaudioprocess = (e) => {
+      if (!micActiveRef.current) return;
+      if (!liveSessionRef.current?.getState().connected) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const mono16k = resampleTo16kHzMono(input, ctx.sampleRate);
+      const pcm16 = floatTo16BitPCM(mono16k);
+      const base64 = arrayBufferToBase64(pcm16.buffer);
+      liveSessionRef.current
+        ?.sendAudioChunk(base64, 'audio/pcm;rate=16000')
+        .then(() => setSentChunks(v => v + 1))
+        .catch((err: any) => {
+          const msg = err?.message || String(err);
+          pushDebugEvent(`Live: sendAudioChunk failed: ${msg}`);
+          setStatusText(msg);
+        });
+    };
+
+    source.connect(processor);
+    // Do not connect to destination to avoid echo.
+    processor.connect(ctx.destination);
+  }, []);
+
+  const playNextLiveAudio = useCallback(() => {
+    if (!liveAudioRef.current) return;
+    if (liveAudioRef.current.paused === false) return;
+    const next = liveAudioQueueRef.current.shift();
+    if (!next) return;
+    liveAudioRef.current.src = next;
+    liveAudioRef.current.play().catch(() => {
+      // If autoplay fails, drop the chunk to avoid deadlocking the queue
+      try { liveAudioRef.current?.pause(); } catch (_) {}
+      playNextLiveAudio();
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!liveAudioRef.current) {
+      const a = new Audio();
+      a.onended = () => playNextLiveAudio();
+      a.onerror = () => playNextLiveAudio();
+      liveAudioRef.current = a;
+    }
+    return () => {
+      stopLiveAudio();
+      stopMicStreaming();
+      try { liveSessionRef.current?.disconnect?.(); } catch (_) {}
+      liveSessionRef.current = null;
+    };
+  }, [playNextLiveAudio, stopLiveAudio, stopMicStreaming]);
+
+  useEffect(() => {
+    // In Electron, keep the overlay click-through by default so the user can
+    // interact with other apps. Only capture mouse while hovering the widget.
+    // During Acting, ALWAYS be click-through so automation reaches the desktop.
+    setClickThrough(state === 'Acting' || !isHoveringWidget);
+  }, [state, isHoveringWidget]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -125,7 +282,6 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     const fullText = currentResponse.explanation;
     if (displayedText.length < fullText.length) {
       const timer = setTimeout(() => {
-        // Type 2-4 chars at a time for speed
         const chunkSize = Math.floor(Math.random() * 3) + 2;
         setDisplayedText(fullText.slice(0, displayedText.length + chunkSize));
       }, 15);
@@ -135,85 +291,44 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     }
   }, [displayedText, isTypingResponse, currentResponse]);
 
-  // Web Speech API for voice recognition
-  const startListening = useCallback(() => {
-    // If already listening, ignore (prevents race conditions)
-    if (isListeningRef.current || recognitionRef.current) return;
+  useEffect(() => {
+    return () => {
+      stopLiveAudio();
+      stopMicStreaming();
+      try { liveSessionRef.current?.disconnect?.(); } catch (_) {}
+    };
+  }, [stopLiveAudio, stopMicStreaming]);
 
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      // Fallback — focus the text input
-      inputRef.current?.focus();
-      return;
-    }
+  const pushDebugEvent = useCallback((message: string) => {
+    if (!DEBUG_OVERLAY) return;
+    const ts = new Date().toLocaleTimeString();
+    setDebugEvents(prev => [`[${ts}] ${message}`, ...prev].slice(0, 12));
+  }, [DEBUG_OVERLAY]);
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-    recognition.maxAlternatives = 1;
+  const startListening = useCallback(async () => {
+    if (micActiveRef.current) return;
 
-    recognition.onstart = () => {
-      isListeningRef.current = true;
-      transcriptRef.current = '';
+    // If the model is speaking, stop it immediately.
+    try { await liveSessionRef.current?.interrupt?.(); } catch (_) {}
+    stopLiveAudio();
+
+    try {
+      await startMicStreaming();
       setIsListening(true);
       setState('Listening');
-    };
-
-    recognition.onresult = (event: any) => {
-      let finalTranscript = '';
-      let interimTranscript = '';
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalTranscript += result[0].transcript;
-        } else {
-          interimTranscript += result[0].transcript;
-        }
-      }
-      if (finalTranscript) {
-        transcriptRef.current += finalTranscript;
-      }
-      setInputText(transcriptRef.current + interimTranscript);
-    };
-
-    recognition.onend = () => {
-      isListeningRef.current = false;
-      recognitionRef.current = null;
+    } catch (e: any) {
+      setStatusText(e?.message || String(e));
       setIsListening(false);
       setState('Idle');
-      // Auto-submit if we captured meaningful speech
-      const captured = transcriptRef.current.trim();
-      if (captured.length > 2) {
-        setInputText(captured);
-        // Use a short delay so the state updates propagate before submit
-        setTimeout(() => handleSubmit(captured), 100);
-      }
-    };
-
-    recognition.onerror = (event: any) => {
-      // 'no-speech' and 'aborted' are non-fatal — don't kill the session
-      if (event.error === 'no-speech' || event.error === 'aborted') {
-        console.warn('Speech recognition:', event.error);
-        return;
-      }
-      console.error('Speech recognition error:', event.error);
-      isListeningRef.current = false;
-      recognitionRef.current = null;
-      setIsListening(false);
-      setState('Idle');
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
-  }, []);
+    }
+  }, [startMicStreaming, stopLiveAudio]);
 
   const stopListening = useCallback(() => {
-    if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch (_) {}
-      // The onend handler will clean up state and auto-submit
-    }
-  }, []);
+    if (!micActiveRef.current) return;
+    stopMicStreaming();
+    setIsListening(false);
+    setState('Responding');
+  }, [stopMicStreaming]);
 
   const playAudio = async (text: string) => {
     setIsSpeaking(true);
@@ -282,6 +397,82 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     const query = text || inputText.trim();
     if (!query) return;
 
+    if (useLiveAgent) {
+      // Minimal Live API test flow: connect (if needed), send text, listen for text/audio events.
+      const userMsg: ChatMessage = {
+        id: generateId(),
+        role: 'user',
+        content: query,
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, userMsg]);
+      setInputText('');
+      setStatusText('');
+      setState('Talking');
+
+      try {
+        if (!liveSessionRef.current) {
+          liveSessionRef.current = createLiveAgentSession({ responseModalities: ['AUDIO', 'TEXT'] });
+          liveSessionRef.current.onEvent((e) => {
+            if (e.type === 'connected') {
+              setLiveConnected(true);
+              pushDebugEvent('Live: connected');
+              setState('Responding');
+              return;
+            }
+            if (e.type === 'disconnected') {
+              setLiveConnected(false);
+              pushDebugEvent('Live: disconnected');
+              setState('Idle');
+              return;
+            }
+            if (e.type === 'interrupted') {
+              pushDebugEvent('Live: interrupted');
+              stopLiveAudio();
+              return;
+            }
+            if (e.type === 'text') {
+              const assistantMsg: ChatMessage = {
+                id: generateId(),
+                role: 'assistant',
+                content: e.text,
+                timestamp: new Date(),
+                status: 'complete',
+              };
+              setMessages(prev => [...prev, assistantMsg]);
+              setState('Responding');
+              return;
+            }
+            if (e.type === 'audio') {
+              const src = `data:${e.mimeType};base64,${e.data}`;
+              liveAudioQueueRef.current.push(src);
+              playNextLiveAudio();
+              return;
+            }
+            if (e.type === 'error') {
+              pushDebugEvent(`Live error: ${e.message}`);
+              setStatusText(e.message);
+              setState('Responding');
+            }
+          });
+        }
+
+        if (!liveSessionRef.current.getState().connected) {
+          await liveSessionRef.current.connect();
+        }
+
+        await liveSessionRef.current.sendText(query, true);
+        setState('Responding');
+      } catch (err: any) {
+        setStatusText(err?.message || String(err));
+        setState('Responding');
+      }
+      return;
+    }
+
+    setLastUserTranscript(query);
+    pushDebugEvent('Submitting request to AI');
+
     // Add user message
     const userMsg: ChatMessage = {
       id: generateId(),
@@ -291,28 +482,46 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     };
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
+    setStatusText('');
     setState('Talking');
 
     // Capture screen context
     const screenshot = await captureScreen();
+    if (!screenshot) {
+      const msg = 'Screen capture failed. Check OS permissions (screen recording) and Electron desktopCapturer.';
+      pushDebugEvent(msg);
+      setStatusText(msg);
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: `Error: ${msg}`,
+        timestamp: new Date(),
+        status: 'error',
+      };
+      setMessages(prev => [...prev, errorMsg]);
+      setCurrentResponse({ explanation: msg, actions: [], status: 'error' });
+      setDisplayedText(msg);
+      setState('Responding');
+      return;
+    }
 
-    // Fetch visual buffer from Electron if available
+    // Fetch contextual data from Electron if available
     const api = (window as any).omniAPI;
     let visualBuffer = undefined;
     let screenDimensions = undefined;
     let environmentInfo = undefined;
     if (api?.getVisualBuffer) {
-      try {
-        visualBuffer = await api.getVisualBuffer();
-      } catch (e) {
-        console.error('Failed to get visual buffer:', e);
+      try { visualBuffer = await api.getVisualBuffer(); } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getVisualBuffer failed: ${msg}`);
+        setStatusText(`getVisualBuffer failed: ${msg}`);
       }
     }
     if (api?.getScreenDimensions) {
-      try {
-        screenDimensions = await api.getScreenDimensions();
-      } catch (e) {
-        console.error('Failed to get screen dimensions:', e);
+      try { screenDimensions = await api.getScreenDimensions(); } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getScreenDimensions failed: ${msg}`);
+        setStatusText(`getScreenDimensions failed: ${msg}`);
       }
     }
     if (api?.getEnvInfo) {
@@ -324,63 +533,103 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
           nodeVersion: info.nodeVersion,
           electronVersion: info.electronVersion,
         };
-      } catch (e) {
-        console.error('Failed to get env info:', e);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getEnvInfo failed: ${msg}`);
+        setStatusText(`getEnvInfo failed: ${msg}`);
       }
     }
 
     // Call Gemini with conversation history + visual context
-    const res = await getSetupInstructions(
-      query,
-      mode,
-      screenshot || undefined,
-      visualBuffer,
-      messages,
-      screenDimensions,
-      environmentInfo
-    );
+    try {
+      pushDebugEvent('Capturing screen/context...');
+      const res = await getSetupInstructions(
+        query,
+        mode,
+        ALLOW_AUTOMATION,
+        screenshot || undefined,
+        visualBuffer,
+        messages,
+        screenDimensions,
+        environmentInfo
+      );
 
-    setCurrentResponse(res);
+      pushDebugEvent('AI response received');
+      if (res.modelUsed) pushDebugEvent(`Thinking model: ${res.modelUsed}`);
+      setCurrentResponse(res);
 
-    // Add assistant message
-    const assistantMsg: ChatMessage = {
-      id: generateId(),
-      role: 'assistant',
-      content: res.explanation,
-      actions: res.actions,
-      timestamp: new Date(),
-      status: res.status === 'error' ? 'error' : 'complete',
-    };
-    setMessages(prev => [...prev, assistantMsg]);
+      // Add assistant message
+      const assistantMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: res.explanation,
+        actions: res.actions,
+        timestamp: new Date(),
+        status: res.status === 'error' ? 'error' : 'complete',
+      };
+      setMessages(prev => [...prev, assistantMsg]);
 
-    // Start typing animation
-    setDisplayedText('');
-    setIsTypingResponse(true);
+      // Start typing animation and show response widget
+      setDisplayedText('');
+      setIsTypingResponse(true);
+      setState('Responding');
 
-    setState('Idle');
+      // If there are actions, execute them after a short delay so user sees the response
+      if (res.actions.length > 0) {
+        if (ALLOW_AUTOMATION) {
+          pushDebugEvent(`Executing ${res.actions.length} action(s)...`);
+          setTimeout(() => executeActions(res), 2000);
+        } else {
+          pushDebugEvent('Automation disabled; ignoring suggested actions');
+        }
+      }
+    } catch (err: any) {
+      console.error('Gemini API error:', err);
+      const errMsg = err?.message || String(err);
+      pushDebugEvent(`AI error: ${errMsg}`);
+      setStatusText(errMsg);
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: `Error: ${errMsg}`,
+        timestamp: new Date(),
+        status: 'error',
+      };
+      setMessages(prev => [...prev, errorMsg]);
+      setCurrentResponse({ explanation: errMsg, actions: [], status: 'error' });
+      setDisplayedText(errMsg);
+      setState('Responding');
+    }
   };
 
-  const runActions = async () => {
-    if (!currentResponse || currentResponse.actions.length === 0) return;
+  const executeActions = async (res: GeminiResponse) => {
+    if (!ALLOW_AUTOMATION) {
+      pushDebugEvent('Automation disabled; not executing actions');
+      setState('Responding');
+      return;
+    }
+    if (!res || res.actions.length === 0) {
+      setState('Responding');
+      return;
+    }
 
     setState('Acting');
     // Enable click-through during action execution so nut.js clicks reach the desktop
     setClickThrough(true);
 
-    for (let i = 0; i < currentResponse.actions.length; i++) {
-      const action = currentResponse.actions[i];
+    for (let i = 0; i < res.actions.length; i++) {
+      const action = res.actions[i];
       setCurrentActionIndex(i);
       setCurrentActionDesc(action.description);
 
       if (action.coordinates) {
         setCurrentCoords(action.coordinates);
       } else {
-        setCurrentCoords(null); // Clear pointer if action has no coordinates
+        setCurrentCoords(null);
       }
 
       if (mode === 'Passive') {
         await playAudio(action.description);
-        // In passive mode, wait for screen stability before next step
         const api = (window as any).omniAPI;
         if (api?.waitForScreenStable) {
           await api.waitForScreenStable({ timeoutMs: 10000 });
@@ -388,29 +637,24 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
           await new Promise(r => setTimeout(r, 3000));
         }
       } else {
-        // Execute the action and wait for it to fully complete via IPC
         await onAction(action);
 
-        // Wait for the screen to visually stabilize before proceeding
-        // This replaces all fixed delays — the system observes the actual
-        // screen and only moves on once things stop changing.
         const api = (window as any).omniAPI;
         if (api?.waitForScreenStable) {
           const result = await api.waitForScreenStable({
-            timeoutMs: action.type === 'command' ? 120000 : 15000, // 2min for commands, 15s otherwise
+            timeoutMs: action.type === 'command' ? 120000 : 15000,
             intervalMs: action.type === 'command' ? 1500 : 800,
           });
           console.log(`[Omni] Screen ${result.stable ? 'stabilized' : 'timed out'} after ${result.elapsed}ms`);
         } else {
-          // Browser fallback — short delay
           await new Promise(r => setTimeout(r, 1000));
         }
       }
     }
 
-    // Restore click-through for the widget area
     setClickThrough(false);
-    setState('Idle');
+    pushDebugEvent('Actions complete');
+    setState('Responding');
     setCurrentActionIndex(-1);
     setCurrentCoords(null);
     setCurrentActionDesc('');
@@ -419,20 +663,6 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
 
   const handleTemplateClick = (template: SetupTemplate) => {
     handleSubmit(template.prompt);
-  };
-
-  const stateColors: Record<SessionState, string> = {
-    Idle: 'bg-emerald-500',
-    Listening: 'bg-red-500',
-    Acting: 'bg-amber-500',
-    Talking: 'bg-blue-500'
-  };
-
-  const stateGlows: Record<SessionState, string> = {
-    Idle: 'glow-emerald',
-    Listening: 'glow-red',
-    Acting: 'glow-amber',
-    Talking: 'glow-blue'
   };
 
   return (
@@ -464,303 +694,188 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
         )}
       </AnimatePresence>
 
-      <div
-        className="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-3"
-        onMouseEnter={() => setClickThrough(false)}
-        onMouseLeave={() => setClickThrough(true)}
-      >
-        <AnimatePresence>
-          {isOpen && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.92, y: 20 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.92, y: 20 }}
-              transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-              className="w-[400px] bg-zinc-950 border border-zinc-800/60 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
-              style={{ maxHeight: 'min(600px, calc(100vh - 120px))' }}
-            >
-              {/* Header */}
-              <div className="px-4 py-3 border-b border-zinc-800/50 flex items-center justify-between bg-zinc-900/80 backdrop-blur-xl shrink-0">
-                <div className="flex items-center gap-2.5">
-                  <div className={`w-2 h-2 rounded-full ${state === 'Listening' ? 'bg-red-500 animate-pulse' :
-                    state === 'Acting' ? 'bg-amber-500' :
-                      state === 'Talking' ? 'bg-blue-500 animate-bounce' : 'bg-emerald-500'
-                    }`} />
-                  <span className="text-[11px] font-mono font-bold uppercase tracking-wider text-zinc-400">
-                    Omni // {state}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {isCapturing && <Camera size={13} className="text-emerald-400 animate-pulse" />}
-                  {isSpeaking && <Volume2 size={13} className="text-blue-400 animate-pulse" />}
-                  <button onClick={() => setIsOpen(false)} className="p-1 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-all" title="Minimize">
-                    <X size={14} />
-                  </button>
-                  <button
-                    onClick={() => {
-                      const api = (window as any).omniAPI;
-                      if (api?.quitApp) {
-                        api.quitApp();
-                      } else {
-                        window.close();
-                      }
-                    }}
-                    className="p-1 text-zinc-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-all"
-                    title="Quit Omni"
-                  >
-                    <Power size={14} />
-                  </button>
-                </div>
-              </div>
-
-              {/* Mode Toggle */}
-              <div className="px-3 py-2 bg-zinc-950 border-b border-zinc-800/30 flex gap-2 shrink-0">
-                <button
-                  onClick={() => setMode('Active')}
-                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${mode === 'Active'
-                    ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20'
-                    : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
-                    }`}
-                >
-                  <Zap size={11} /> Active
-                </button>
-                <button
-                  onClick={() => setMode('Passive')}
-                  className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 transition-all ${mode === 'Passive'
-                    ? 'bg-amber-500/10 text-amber-500 border border-amber-500/20'
-                    : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
-                    }`}
-                >
-                  <Eye size={11} /> Passive
-                </button>
-              </div>
-
-              {/* Chat Content */}
-              <div className="flex-1 overflow-y-auto custom-scrollbar">
-                {messages.length === 0 ? (
-                  // Empty state — show templates
-                  <div className="p-4 space-y-4">
-                    <div className="text-center py-4">
-                      <div className="inline-flex p-3 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-blue-500/10 mb-3">
-                        <MessageSquare className="text-emerald-500" size={24} />
+              <div
+                className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-3"
+                onMouseEnter={() => setIsHoveringWidget(true)}
+                onMouseLeave={() => setIsHoveringWidget(false)}
+              >
+                {/* Voice-first status / stop button */}
+                <AnimatePresence mode="popLayout">
+                  {isHoveringWidget && useLiveAgent && (
+                    <motion.div
+                      key="voice-status"
+                      initial={{ opacity: 0, scale: 0.98, y: 8 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.98, y: 8 }}
+                      className="px-3 py-2 rounded-full bg-zinc-900/60 backdrop-blur-2xl border border-white/10 shadow-2xl flex items-center gap-2"
+                    >
+                      <div className={liveConnected ? 'text-emerald-400' : 'text-white/40'}>
+                        <CircleDot size={14} />
                       </div>
-                      <p className="text-sm font-semibold text-zinc-300">What would you like to set up?</p>
-                      <p className="text-[11px] text-zinc-600 mt-1">Choose a template or type your question</p>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      {TEMPLATES.map(template => (
-                        <motion.button
-                          key={template.id}
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          onClick={() => handleTemplateClick(template)}
-                          className="p-3 rounded-xl text-left bg-zinc-900/50 border border-zinc-800/50 hover:border-emerald-500/30 hover:bg-zinc-800/50 transition-all group"
-                        >
-                          <div className="flex items-center gap-2 mb-1.5">
-                            <div className="text-zinc-500 group-hover:text-emerald-400 transition-colors">
-                              {TEMPLATE_ICONS[template.icon] || <Code2 size={16} />}
-                            </div>
-                            <span className="text-xs font-bold text-zinc-300 group-hover:text-white transition-colors">
-                              {template.label}
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-zinc-600 leading-relaxed">
-                            {template.description}
-                          </p>
-                        </motion.button>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  // Chat thread
-                  <div className="p-4 space-y-4">
-                    {messages.map((msg, idx) => (
-                      <motion.div
-                        key={msg.id}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.3 }}
-                        className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                      <span className="text-[11px] text-white/60 font-medium">
+                        {liveConnected
+                          ? (isListening ? `listening · ↑${sentChunks} ↓${receivedChunks}` : `ready · ↑${sentChunks} ↓${receivedChunks}`)
+                          : (statusText ? statusText : 'connecting...')}
+                      </span>
+                      <button
+                        onClick={async () => {
+                          await resetToIdle();
+                        }}
+                        className="ml-2 px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] font-semibold text-white/70"
                       >
-                        {msg.role === 'user' ? (
-                          // User message
-                          <div className="max-w-[85%] bg-emerald-600/20 border border-emerald-500/20 rounded-2xl rounded-br-sm px-3.5 py-2.5">
-                            <p className="text-sm text-emerald-100 leading-relaxed">{msg.content}</p>
-                            <p className="text-[9px] text-emerald-500/50 mt-1 text-right">
-                              {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                            </p>
-                          </div>
-                        ) : (
-                          // Assistant message
-                          <div className="max-w-[90%] space-y-3">
-                            <div className="bg-zinc-900/60 border border-zinc-800/50 rounded-2xl rounded-bl-sm px-3.5 py-2.5">
-                              <div className="prose prose-invert prose-sm max-w-none text-[13px] leading-relaxed">
-                                <ReactMarkdown>
-                                  {idx === messages.length - 1 && isTypingResponse
-                                    ? displayedText
-                                    : msg.content
-                                  }
-                                </ReactMarkdown>
-                                {idx === messages.length - 1 && isTypingResponse && (
-                                  <span className="typing-cursor" />
-                                )}
-                              </div>
-                              <p className="text-[9px] text-zinc-700 mt-1">
-                                {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                              </p>
-                            </div>
+                        Stop
+                      </button>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
 
-                            {/* Action steps */}
-                            {msg.actions && msg.actions.length > 0 && !isTypingResponse && (
-                              <motion.div
-                                initial={{ opacity: 0, y: 10 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: 0.2 }}
-                                className="space-y-2"
-                              >
-                                <div className="flex items-center gap-2 px-1">
-                                  <CircleDot size={10} className="text-zinc-600" />
-                                  <span className="text-[10px] font-bold text-zinc-600 uppercase tracking-wider">
-                                    {msg.actions.length} Actions Planned
-                                  </span>
-                                </div>
-                                {msg.actions.map((action, aidx) => (
-                                  <motion.div
-                                    key={aidx}
-                                    initial={{ opacity: 0, x: -10 }}
-                                    animate={{ opacity: 1, x: 0 }}
-                                    transition={{ delay: 0.1 * aidx }}
-                                    className={`p-2.5 rounded-lg border transition-all flex items-start gap-2.5 ${currentActionIndex === aidx
-                                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                                      : currentActionIndex > aidx
-                                        ? 'bg-zinc-800/30 border-zinc-700/50 text-zinc-500'
-                                        : 'bg-zinc-900/40 border-zinc-800/50 text-zinc-300'
-                                      }`}
-                                  >
-                                    {currentActionIndex > aidx ? (
-                                      <CheckCircle2 size={14} className="text-emerald-500 shrink-0 mt-0.5" />
-                                    ) : currentActionIndex === aidx ? (
-                                      <Loader2 size={14} className="animate-spin shrink-0 mt-0.5" />
-                                    ) : (
-                                      <div className="w-3.5 h-3.5 rounded-full border-2 border-zinc-700 shrink-0 mt-0.5" />
-                                    )}
-                                    <div className="flex-1 min-w-0">
-                                      <p className="text-[12px] font-medium leading-snug">{action.description}</p>
-                                      <p className="text-[9px] font-mono opacity-40 mt-0.5 uppercase">
-                                        {action.type}{action.value ? ` → ${action.value}` : ''}
-                                      </p>
-                                    </div>
-                                  </motion.div>
-                                ))}
+                <motion.button
+                  layout
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  animate={state === 'Listening' ? { scale: 1.05 } : { scale: 1 }}
+                  onClick={async () => {
+                    setStatusText('');
+                    if (!useLiveAgent) {
+                      startListening();
+                      return;
+                    }
 
-                                {/* Execute / Guide button */}
-                                {state !== 'Acting' && currentActionIndex === -1 && (
-                                  <motion.button
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    onClick={runActions}
-                                    className="w-full py-2.5 bg-zinc-100 hover:bg-white text-zinc-900 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2"
-                                  >
-                                    <Play size={16} fill="currentColor" />
-                                    {mode === 'Active' ? 'Execute Setup' : 'Start Guidance'}
-                                  </motion.button>
-                                )}
-                              </motion.div>
-                            )}
-                          </div>
-                        )}
-                      </motion.div>
-                    ))}
+                    // Voice-first Live:
+                    // - click to start talking (auto-connect)
+                    // - click again to stop
+                    if (isListening) {
+                      stopListening();
+                      return;
+                    }
 
-                    {/* Loading state */}
-                    {state === 'Talking' && (
-                      <motion.div
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="flex justify-start"
-                      >
-                        <div className="bg-zinc-900/60 border border-zinc-800/50 rounded-2xl rounded-bl-sm px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader2 className="animate-spin text-emerald-500" size={16} />
-                            <span className="text-xs text-zinc-400 animate-pulse">Analyzing your environment...</span>
-                          </div>
-                        </div>
-                      </motion.div>
-                    )}
+                    try {
+                      if (!liveSessionRef.current) {
+                        liveSessionRef.current = createLiveAgentSession({ responseModalities: ['AUDIO', 'TEXT'] });
+                        liveSessionRef.current.onEvent((e) => {
+                          if (e.type === 'connected') {
+                            setLiveConnected(true);
+                            pushDebugEvent('Live: connected');
+                            setStatusText('');
+                            return;
+                          }
+                          if (e.type === 'disconnected') {
+                            setLiveConnected(false);
+                            pushDebugEvent('Live: disconnected');
+                            stopMicStreaming();
+                            stopLiveAudio();
+                            setIsListening(false);
+                            setState('Idle');
+                            setStatusText('Live disconnected');
+                            return;
+                          }
+                          if (e.type === 'interrupted') {
+                            pushDebugEvent('Live: interrupted');
+                            stopLiveAudio();
+                            return;
+                          }
+                          if (e.type === 'audio') {
+                            const src = `data:${e.mimeType};base64,${e.data}`;
+                            liveAudioQueueRef.current.push(src);
+                            setReceivedChunks(v => v + 1);
+                            playNextLiveAudio();
+                            return;
+                          }
+                          if (e.type === 'text') {
+                            const assistantMsg: ChatMessage = {
+                              id: generateId(),
+                              role: 'assistant',
+                              content: e.text,
+                              timestamp: new Date(),
+                              status: 'complete',
+                            };
+                            setMessages(prev => [...prev, assistantMsg]);
+                            return;
+                          }
+                          if (e.type === 'error') {
+                            pushDebugEvent(`Live error: ${e.message}`);
+                            setStatusText(e.message);
+                            if (String(e.message || '').toLowerCase().includes('websocket')) {
+                              stopMicStreaming();
+                              setIsListening(false);
+                              setState('Idle');
+                            }
+                          }
+                        });
+                      }
 
-                    <div ref={chatEndRef} />
-                  </div>
-                )}
-              </div>
+                      if (!liveSessionRef.current.getState().connected) {
+                        setStatusText('Connecting to Live...');
+                        const connectPromise = liveSessionRef.current.connect();
+                        const timeoutPromise = new Promise<void>((_, reject) =>
+                          setTimeout(() => reject(new Error('Live connect timed out (10s). Check GEMINI_API_KEY / network / model id.')), 10000)
+                        );
+                        await Promise.race([connectPromise, timeoutPromise]);
+                      }
+                    } catch (e: any) {
+                      setLiveConnected(false);
+                      stopMicStreaming();
+                      stopLiveAudio();
+                      setIsListening(false);
+                      setState('Idle');
+                      setStatusText(e?.message || String(e));
+                      return;
+                    }
 
-              {/* Input Bar */}
-              <div className="p-3 border-t border-zinc-800/30 bg-zinc-900/50 backdrop-blur-xl shrink-0">
-                <div className="flex items-center gap-2">
-                  {/* Voice button */}
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={isListening ? stopListening : startListening}
-                    className={`p-2.5 rounded-xl transition-all shrink-0 ${isListening
-                      ? 'bg-red-500/20 text-red-400 border border-red-500/30'
-                      : 'bg-zinc-800 text-zinc-400 hover:text-emerald-400 hover:bg-zinc-700 border border-transparent'
-                      }`}
-                  >
-                    {isListening ? <Square size={16} fill="currentColor" /> : <Mic size={16} />}
-                  </motion.button>
-
-                  {/* Text input */}
-                  <input
-                    ref={inputRef}
-                    type="text"
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
-                    placeholder={isListening ? 'Listening...' : 'Ask about any setup...'}
-                    className="flex-1 bg-zinc-800/50 border border-zinc-700/50 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/30 focus:bg-zinc-800 transition-all"
-                    disabled={state === 'Talking' || state === 'Acting'}
-                  />
-
-                  {/* Send button */}
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => handleSubmit()}
-                    disabled={!inputText.trim() || state === 'Talking' || state === 'Acting'}
-                    className="p-2.5 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 disabled:bg-zinc-800 disabled:text-zinc-600 transition-all shrink-0"
-                  >
-                    <Send size={16} />
-                  </motion.button>
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* The Floating Bubble */}
-        <motion.button
-          whileHover={{ scale: 1.08 }}
-          whileTap={{ scale: 0.92 }}
-          onClick={() => setIsOpen(!isOpen)}
-          className={`w-14 h-14 rounded-full shadow-2xl flex items-center justify-center transition-all duration-500 relative group ${stateColors[state]} ${stateGlows[state]}`}
+                    // Starting to talk interrupts any ongoing model speech.
+                    try { await liveSessionRef.current?.interrupt?.(); } catch (_) {}
+                    stopLiveAudio();
+                    startListening();
+                  }}
+                  className={`flex items-center gap-2.5 px-4 h-11 rounded-full shadow-2xl transition-all duration-300 backdrop-blur-2xl border relative group z-50 ${state === 'Listening'
+                    ? 'bg-emerald-500/20 border-emerald-500/30 shadow-emerald-500/20'
+                    : 'bg-zinc-900/60 border-white/10 hover:bg-zinc-900/80 hover:border-white/20'
+                    }`}
         >
-          <div className="absolute inset-0 rounded-full bg-inherit animate-ping opacity-15 group-hover:opacity-30" />
-          <AnimatePresence mode="wait">
-            {isOpen ? (
-              <motion.div key="close" initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} exit={{ rotate: 90, opacity: 0 }}>
-                <X className="text-white" size={22} />
-              </motion.div>
-            ) : state === 'Listening' ? (
-              <motion.div key="stop" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                <Square fill="white" className="text-white" size={20} />
-              </motion.div>
-            ) : (
-              <motion.div key="mic" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                <MessageSquare className="text-white" size={22} />
-              </motion.div>
-            )}
-          </AnimatePresence>
+          <div className="relative w-4 h-4 flex items-center justify-center">
+            <AnimatePresence mode="wait">
+              {state !== 'Listening' ? (
+                <motion.div
+                  key="mic"
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.5 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute inset-0 flex items-center justify-center"
+                >
+                  <Mic className="text-white/80 group-hover:text-white transition-colors" size={16} />
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="viz"
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.5 }}
+                  className="absolute inset-0 flex items-center justify-center gap-[2px] h-3.5"
+                >
+                  {[
+                    ['30%', '90%', '40%', '100%', '30%'],
+                    ['40%', '100%', '20%', '80%', '40%'],
+                    ['50%', '80%', '40%', '100%', '50%'],
+                    ['20%', '100%', '50%', '80%', '20%']
+                  ].map((heights, i) => (
+                    <motion.div
+                      key={i}
+                      animate={{ height: heights }}
+                      transition={{
+                        duration: 1.5 + i * 0.3,
+                        repeat: Infinity,
+                        repeatType: 'reverse',
+                        ease: "easeInOut"
+                      }}
+                      className="w-[2px] rounded-full bg-blue-400"
+                    />
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+          <span className="text-[13px] font-semibold text-white/90 tracking-wide">Omni</span>
         </motion.button>
       </div>
     </>

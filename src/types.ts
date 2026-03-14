@@ -1,5 +1,5 @@
 export type AgentMode = 'Passive' | 'Active';
-export type SessionState = 'Idle' | 'Listening' | 'Acting' | 'Talking';
+export type SessionState = 'Idle' | 'Listening' | 'Acting' | 'Talking' | 'Responding';
 
 export interface Point {
   x: number;
@@ -18,6 +18,7 @@ export interface GeminiResponse {
   explanation: string;
   actions: SetupAction[];
   status: 'success' | 'error' | 'pending';
+  modelUsed?: string;
 }
 
 export interface VisualFrame {

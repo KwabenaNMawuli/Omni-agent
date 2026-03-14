@@ -13,8 +13,9 @@ type TransitionCallback = (from: SessionState, to: SessionState) => void;
 const VALID_TRANSITIONS: Record<SessionState, SessionState[]> = {
     Idle: ['Listening'],
     Listening: ['Talking', 'Idle'],
-    Talking: ['Acting', 'Idle'],
+    Talking: ['Acting', 'Idle', 'Responding'],
     Acting: ['Idle', 'Talking'],
+    Responding: ['Idle', 'Acting'],
 };
 
 export class SessionController {

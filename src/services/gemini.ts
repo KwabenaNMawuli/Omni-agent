@@ -4,17 +4,302 @@ import { GeminiResponse, SetupAction, VisualFrame, ChatMessage } from "../types"
 // Lazy-initialize the client so a missing API key doesn't crash the whole app
 let _ai: GoogleGenAI | null = null;
 
+let _lastGoodThinkingModel: string | null = null;
+
+async function generateWithFallback(args: {
+  models: string[];
+  request: (model: string) => Promise<any>;
+}): Promise<{ model: string; response: any }> {
+  let lastError: any = null;
+  for (const m of args.models) {
+    try {
+      const response = await args.request(m);
+      return { model: m, response };
+    } catch (e: any) {
+      lastError = e;
+      const msg = (e?.message || String(e) || '').toLowerCase();
+      if (msg.includes('not found') || msg.includes('model') || msg.includes('404')) {
+        continue;
+      }
+      // Non-model error: fail fast
+      throw e;
+    }
+  }
+  const message = lastError?.message || String(lastError) || 'No available model succeeded';
+  throw new Error(message);
+}
+
+function formatGenAIError(err: any): string {
+  if (!err) return 'Unknown error';
+  if (typeof err === 'string') return err;
+
+  const parts: string[] = [];
+  const msg = err?.message || err?.error?.message;
+  if (msg) parts.push(String(msg));
+
+  const status = err?.status || err?.code || err?.error?.code;
+  if (status) parts.push(`status=${status}`);
+
+  const details = err?.error?.details || err?.details;
+  if (Array.isArray(details) && details.length) {
+    const d0 = details[0];
+    const dmsg = d0?.message || d0?.reason;
+    if (dmsg) parts.push(`details=${dmsg}`);
+  }
+
+  const causeMsg = err?.cause?.message;
+  if (causeMsg) parts.push(`cause=${causeMsg}`);
+
+  return parts.filter(Boolean).join(' | ') || 'Unknown error';
+}
+
 function getAI(): GoogleGenAI {
   if (!_ai) {
-    const key = process.env.GEMINI_API_KEY;
+    // In Vite renderer builds, env vars are available via import.meta.env.
+    // We also support the string define() shim (process.env.GEMINI_API_KEY) for compatibility.
+    const key =
+      (import.meta as any)?.env?.GEMINI_API_KEY ||
+      (process.env as any)?.GEMINI_API_KEY;
     if (!key) {
       throw new Error(
         "GEMINI_API_KEY is not set. Create a .env.local file with GEMINI_API_KEY=your_key"
       );
     }
-    _ai = new GoogleGenAI({ apiKey: key });
+    // Ensure the underlying websocket URL is well-formed in Electron builds.
+    _ai = new GoogleGenAI({ apiKey: key, baseUrl: 'https://generativelanguage.googleapis.com' } as any);
   }
   return _ai;
+}
+
+export type LiveAgentEvent =
+  | { type: 'connected' }
+  | { type: 'disconnected' }
+  | { type: 'interrupted' }
+  | { type: 'text'; text: string }
+  | { type: 'audio'; mimeType: string; data: string }
+  | { type: 'error'; message: string };
+
+export interface LiveAgentSession {
+  connect: () => Promise<void>;
+  disconnect: () => Promise<void>;
+  sendText: (text: string, turnComplete?: boolean) => Promise<void>;
+  sendAudioChunk: (pcm16Base64: string, mimeType?: string) => Promise<void>;
+  interrupt: () => Promise<void>;
+  onEvent: (handler: (e: LiveAgentEvent) => void) => () => void;
+  getState: () => { connected: boolean };
+}
+
+export function createLiveAgentSession(args?: {
+  model?: string;
+  responseModalities?: Array<'AUDIO' | 'TEXT'>;
+}): LiveAgentSession {
+  const model = args?.model || 'gemini-2.0-flash-live-preview-04-09';
+  const responseModalities = args?.responseModalities || ['AUDIO'];
+
+  let connected = false;
+  let session: any = null;
+  let readerTask: Promise<void> | null = null;
+  const handlers = new Set<(e: LiveAgentEvent) => void>();
+
+  const isAsyncIterable = (obj: any): obj is AsyncIterable<any> => {
+    return !!obj && typeof obj[Symbol.asyncIterator] === 'function';
+  };
+
+  const getEventEmitter = (obj: any): any | null => {
+    if (!obj) return null;
+    if (typeof obj?.on === 'function') return obj;
+    if (typeof obj?.conn?.on === 'function') return obj.conn;
+    if (typeof obj?.connection?.on === 'function') return obj.connection;
+    return null;
+  };
+
+  const describeObject = (obj: any): string => {
+    try {
+      if (!obj) return String(obj);
+      const keys = Object.keys(obj);
+      return `type=${typeof obj} ctor=${obj?.constructor?.name || 'unknown'} keys=[${keys.slice(0, 20).join(', ')}]`;
+    } catch {
+      return 'uninspectable session object';
+    }
+  };
+
+  const emit = (e: LiveAgentEvent) => {
+    for (const h of handlers) h(e);
+  };
+
+  const connect = async () => {
+    if (connected) return;
+    try {
+      // Protect against a hung websocket connect by using an AbortController timeout.
+      const abortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timeoutMs = 15000;
+      const timeout = setTimeout(() => abortController?.abort(), timeoutMs);
+      try {
+        session = await (getAI() as any).live.connect({
+          model,
+          config: {
+            responseModalities,
+            inputAudioFormat: {
+              mimeType: 'audio/pcm;rate=16000',
+            },
+            outputAudioFormat: {
+              mimeType: 'audio/pcm;rate=24000',
+            },
+          },
+          ...(abortController ? { signal: abortController.signal } : {}),
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+      connected = true;
+      emit({ type: 'connected' });
+
+      readerTask = (async () => {
+        try {
+          const handleServerMessage = (message: any) => {
+            const sc = message?.serverContent;
+            if (sc?.interrupted) {
+              emit({ type: 'interrupted' });
+              return;
+            }
+
+            const parts = sc?.modelTurn?.parts || sc?.parts || [];
+            for (const p of parts) {
+              if (typeof p?.text === 'string' && p.text.trim()) {
+                emit({ type: 'text', text: p.text });
+              }
+              const inline = p?.inlineData;
+              if (inline?.data && inline?.mimeType) {
+                emit({ type: 'audio', mimeType: inline.mimeType, data: inline.data });
+              }
+            }
+          };
+
+          if (isAsyncIterable(session)) {
+            for await (const message of session) {
+              handleServerMessage(message);
+            }
+          } else {
+            const emitter = getEventEmitter(session);
+            if (!emitter) {
+              throw new Error(
+                `Live session is not async-iterable and has no .on() handler. ${describeObject(session)}`
+              );
+            }
+
+            // Some SDK builds return an event-emitter-like session (or expose it under .conn).
+            await new Promise<void>((resolve, reject) => {
+              const onMessage = (m: any) => handleServerMessage(m);
+              const onError = (e: any) => reject(e);
+              const onClose = () => resolve();
+
+              try {
+                emitter.on('message', onMessage);
+                emitter.on('error', onError);
+                emitter.on('close', onClose);
+              } catch (e) {
+                reject(e);
+              }
+            });
+          }
+
+          // Iterator ended -> treat as disconnected
+          if (connected) {
+            connected = false;
+            emit({ type: 'disconnected' });
+          }
+        } catch (e: any) {
+          if (connected) {
+            connected = false;
+            emit({ type: 'disconnected' });
+          }
+          const msg = e?.name === 'AbortError'
+            ? 'Live connect timed out (15s). Check GEMINI_API_KEY, network, and model id.'
+            : (e?.message || String(e));
+          emit({ type: 'error', message: msg });
+        }
+      })();
+    } catch (e: any) {
+      const msg = e?.name === 'AbortError'
+        ? 'Live connect timed out (15s). Check GEMINI_API_KEY, network, and model id.'
+        : (e?.message || String(e));
+      emit({ type: 'error', message: msg });
+      throw e;
+    }
+  };
+
+  const disconnect = async () => {
+    if (!connected) return;
+    try {
+      connected = false;
+      try {
+        await session?.close?.();
+      } catch (_) {}
+      session = null;
+      emit({ type: 'disconnected' });
+      await readerTask;
+    } finally {
+      readerTask = null;
+    }
+  };
+
+  const sendText = async (text: string, turnComplete: boolean = true) => {
+    if (!connected || !session) throw new Error('Live session is not connected');
+    await session.sendClientContent({ turns: text, turnComplete });
+  };
+
+  const sendAudioChunk = async (pcm16Base64: string, mimeType: string = 'audio/pcm;rate=16000') => {
+    if (!connected || !session) throw new Error('Live session is not connected');
+    // @google/genai live sessions accept client content with inlineData parts.
+    // We send raw PCM16 mono 16kHz frames as base64.
+    try {
+      await session.sendClientContent({
+        turns: [
+          {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: pcm16Base64,
+                },
+              },
+            ],
+          },
+        ],
+        turnComplete: false,
+      });
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (msg.toLowerCase().includes('websocket') || msg.toLowerCase().includes('closed')) {
+        connected = false;
+        emit({ type: 'disconnected' });
+      }
+      throw e;
+    }
+  };
+
+  const interrupt = async () => {
+    if (!connected || !session) return;
+    try {
+      await session.sendClientContent({ turns: ' ', turnComplete: true });
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      if (msg.toLowerCase().includes('websocket') || msg.toLowerCase().includes('closed')) {
+        connected = false;
+        emit({ type: 'disconnected' });
+      }
+      throw e;
+    }
+  };
+
+  const onEvent = (handler: (e: LiveAgentEvent) => void) => {
+    handlers.add(handler);
+    return () => handlers.delete(handler);
+  };
+
+  const getState = () => ({ connected });
+
+  return { connect, disconnect, sendText, sendAudioChunk, interrupt, onEvent, getState };
 }
 
 /**
@@ -25,13 +310,25 @@ function getAI(): GoogleGenAI {
 export async function getSetupInstructions(
   userIntent: string,
   mode: 'Passive' | 'Active',
+  automationEnabled: boolean,
   currentScreenBase64?: string,
   visualBuffer?: VisualFrame[],
   conversationHistory?: ChatMessage[],
   screenDimensions?: { width: number; height: number; scaleFactor: number },
   environmentInfo?: { os: string; shell: string; nodeVersion?: string; electronVersion?: string }
 ): Promise<GeminiResponse> {
-  const model = "gemini-2.5-flash";
+  const preferredModels = [
+    "gemini-3.0-flash",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+  ];
+
+  const modelsToTry = (
+    _lastGoodThinkingModel
+      ? [_lastGoodThinkingModel, ...preferredModels.filter(m => m !== _lastGoodThinkingModel)]
+      : preferredModels
+  );
 
   const screenInfo = screenDimensions
     ? `\nSCREEN RESOLUTION: ${screenDimensions.width}x${screenDimensions.height} pixels (scale factor: ${screenDimensions.scaleFactor}).
@@ -53,66 +350,46 @@ COORDINATE SYSTEM: You return coordinates as percentages (0-100) of the full scr
   - Package Managers: On Windows use "winget" (preferred) or PowerShell. On macOS use "brew". On Linux use "apt" / "dnf" as appropriate.`
     : '';
 
-  const systemInstruction = `You are Omni, an AUTONOMOUS desktop automation agent that installs and configures development tools.
-You have DIRECT control of the user's computer through shell commands and mouse/keyboard automation.
-EVERYTHING YOU DO IS VISIBLE to the user — they watch the mouse move, see text being typed character
-by character, and observe commands running in a real terminal window. This is intentional: the user
-is learning by watching you work so they can repeat the steps on their own later.
+  const systemInstruction = automationEnabled
+    ? `You are Omni, an AUTONOMOUS desktop agent.
+
+You can propose actions for the system to execute (shell commands, mouse/keyboard automation). Keep actions safe and minimal.
 
 CRITICAL RULES:
-1. For software installation or configuration, ALWAYS prefer 'command' actions that run actual shell commands.
-   When you use a 'command' action, the system VISUALLY opens a PowerShell window (if not already open),
-   types the command character by character so the user can read it, then presses Enter.
-   Examples: "winget install --id Oracle.JDK.21 -e --accept-source-agreements --accept-package-agreements",
-             "choco install openjdk", "brew install openjdk", "sudo apt install openjdk-21-jdk"
-2. NEVER generate a 'wait' action as your first or only action. Always produce substantive actions.
-3. NEVER try to click on the Omni overlay/widget itself — it is NOT part of the desktop you're operating.
-   The Omni overlay is removed from screenshots. You must never click 'Execute Setup' or any Omni UI element.
-4. Use 'click' actions only when you need to interact with REAL applications on the desktop (e.g., clicking
-   a browser download link, a dialog button, or an installer Next button that is actually visible on screen).
-5. Produce a COMPLETE action plan in one response. Don't say "I'll wait for analysis" — YOU are the analyzer.
-6. For multi-step installs, chain all commands in order. The system waits for each to finish before the next.
-   All commands go into the SAME terminal window, so they share state (env vars, working directory, etc.).
-7. Keep commands simple and one-per-action. Don't chain with && or ; — use separate actions instead so
-   the user can see each step clearly.
+1. Never click on the Omni overlay/widget itself.
+2. Prefer 'command' actions for install/config tasks.
+3. Use 'click' actions only when necessary and only for elements visible on the real desktop.
+4. Keep commands simple and one-per-action.
 
 CONTEXT:
 - Screenshots show the user's REAL desktop (the Omni overlay is hidden during capture).
 - The screenshots are ordered chronologically — the LAST image is the CURRENT screen state.${screenInfo}${envInfo}
 
 MODE: ${mode}
-- Active Mode: You generate actions for the system to execute automatically using desktop automation.
-  The user WATCHES everything happen — mouse movements, typing, terminal commands are all visible.
-  Provide precise coordinates (0-100 normalized) for mouse operations.
-- Passive Mode: You guide the user step-by-step with clear instructions and visual highlights.
-  Provide coordinates (0-100 normalized) for where highlights should appear.
-
-AVAILABLE ACTIONS (use 'command' as your primary tool):
-- 'command': Run a shell command in a VISIBLE terminal. value = the command string.
-   The system opens a real PowerShell window, types the command at readable speed, and presses Enter.
-   The user sees everything. This is your MAIN TOOL for installations and configuration.
-- 'click': Click at a screen position. The mouse visibly moves to the target, pauses, then clicks.
-   coordinates = {x, y} as percentages (0-100). Only for REAL desktop apps visible on screen.
-- 'type': Type text into a focused field at readable speed. target = field description, value = text.
-- 'keypress': Press a key combination. value = key string (e.g., 'Enter', 'Ctrl+S', 'Tab').
-- 'scroll': Scroll in a direction. value = 'up' | 'down'.
-- 'highlight': (Passive mode) Highlight an area. coordinates = {x, y}, description = what to look for.
-- 'wait': Wait for a process. value = duration in ms. Use SPARINGLY and only between other real actions.
+- Active Mode: You may output actions for automation.
+- Passive Mode: You may output guidance and optional highlight coordinates.
 
 RESPONSE FORMAT (JSON):
-- explanation: Friendly, jargon-free markdown explaining what you're doing and why
-- actions: Ordered array of concrete actions to perform (always include at least one substantive action)
-- status: 'success' if you can help, 'pending' if you need more info, 'error' if something is wrong
+- explanation: Friendly, clear markdown.
+- actions: Ordered array of concrete actions to perform.
+- status: 'success' | 'pending' | 'error'.`
+    : `You are Omni, an AUTONOMOUS desktop agent.
 
-EXAMPLE — Installing JDK on Windows:
-{
-  "explanation": "I'll install the Java Development Kit (JDK 21) using Windows Package Manager (winget)...",
-  "actions": [
-    { "type": "command", "value": "winget install --id Oracle.JDK.21 -e --accept-source-agreements --accept-package-agreements", "description": "Install JDK 21 via winget" },
-    { "type": "command", "value": "java -version", "description": "Verify Java installation" }
-  ],
-  "status": "success"
-}`;
+IMPORTANT:
+- Automation is currently DISABLED in the app.
+- You must NOT output any actions. Return an empty actions array always.
+- Provide only guidance in explanation.
+
+CONTEXT:
+- Screenshots show the user's REAL desktop (the Omni overlay is hidden during capture).
+- The screenshots are ordered chronologically — the LAST image is the CURRENT screen state.${screenInfo}${envInfo}
+
+MODE: ${mode}
+
+RESPONSE FORMAT (JSON):
+- explanation: Friendly, clear markdown.
+- actions: []
+- status: 'success' | 'pending' | 'error'.`;
 
   // Build content parts: conversation context + visual frames + current intent
   const contents: any[] = [];
@@ -160,54 +437,61 @@ EXAMPLE — Installing JDK on Windows:
   contents.push({ text: `\nUser's request: ${userIntent}` });
 
   try {
-    const response = await getAI().models.generateContent({
-      model,
-      contents: { parts: contents },
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            explanation: { type: Type.STRING },
-            actions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  type: {
-                    type: Type.STRING,
-                    enum: ['type', 'click', 'wait', 'command', 'highlight', 'scroll', 'keypress']
-                  },
-                  target: { type: Type.STRING },
-                  value: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  coordinates: {
+    const { model, response } = await generateWithFallback({
+      models: modelsToTry,
+      request: (model) =>
+        getAI().models.generateContent({
+          model,
+          contents: [{ role: 'user', parts: contents }],
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                explanation: { type: Type.STRING },
+                actions: {
+                  type: Type.ARRAY,
+                  items: {
                     type: Type.OBJECT,
                     properties: {
-                      x: { type: Type.NUMBER },
-                      y: { type: Type.NUMBER }
+                      type: {
+                        type: Type.STRING,
+                        enum: ['type', 'click', 'wait', 'command', 'highlight', 'scroll', 'keypress']
+                      },
+                      target: { type: Type.STRING },
+                      value: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                      coordinates: {
+                        type: Type.OBJECT,
+                        properties: {
+                          x: { type: Type.NUMBER },
+                          y: { type: Type.NUMBER }
+                        },
+                        required: ['x', 'y']
+                      }
                     },
-                    required: ['x', 'y']
+                    required: ['type', 'description']
                   }
                 },
-                required: ['type', 'description']
-              }
-            },
-            status: { type: Type.STRING, enum: ['success', 'error', 'pending'] }
-          },
-          required: ['explanation', 'actions', 'status']
-        }
-      }
+                status: { type: Type.STRING, enum: ['success', 'error', 'pending'] }
+              },
+              required: ['explanation', 'actions', 'status']
+            }
+          }
+        }),
     });
 
-    return JSON.parse(response.text || "{}") as GeminiResponse;
-  } catch (error) {
+    const parsed = JSON.parse(response.text || "{}") as GeminiResponse;
+    _lastGoodThinkingModel = model;
+    return { ...parsed, modelUsed: model };
+  } catch (error: any) {
+    const msg = formatGenAIError(error);
     console.error("Gemini API Error:", error);
     return {
-      explanation: "I encountered an error connecting to the AI service. Please check your API key and try again.",
+      explanation: `Gemini request failed: ${msg}`,
       actions: [],
-      status: 'error'
+      status: 'error',
     };
   }
 }
@@ -220,7 +504,7 @@ export async function generateSpeech(text: string): Promise<string | null> {
   try {
     const response = await getAI().models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `Say clearly and helpfully: ${text}` }] }],
+      contents: [{ role: 'user', parts: [{ text: `Say clearly and helpfully: ${text}` }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -233,7 +517,7 @@ export async function generateSpeech(text: string): Promise<string | null> {
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     return base64Audio || null;
-  } catch (error) {
+  } catch (error: any) {
     console.error("TTS Error:", error);
     return null;
   }

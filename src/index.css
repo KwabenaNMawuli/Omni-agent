@@ -25,7 +25,7 @@
 
   /* Custom scrollbar */
   .custom-scrollbar::-webkit-scrollbar {
-    width: 5px;
+    width: 8px;
   }
 
   .custom-scrollbar::-webkit-scrollbar-track {
@@ -33,11 +33,19 @@
   }
 
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    @apply bg-zinc-800 rounded-full;
+    @apply rounded-full;
+    background: linear-gradient(180deg, rgba(39, 39, 42, 0.9), rgba(24, 24, 27, 0.7));
+    border: 2px solid rgba(0, 0, 0, 0);
+    background-clip: padding-box;
   }
 
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    @apply bg-zinc-700;
+    background: linear-gradient(180deg, rgba(63, 63, 70, 0.9), rgba(39, 39, 42, 0.8));
+  }
+
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(63, 63, 70, 0.8) transparent;
   }
 
   /* Glassmorphism card */
