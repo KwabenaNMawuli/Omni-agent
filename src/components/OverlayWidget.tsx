@@ -172,6 +172,21 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     micStreamRef.current = null;
   }, []);
 
+  const resetToIdle = useCallback(async () => {
+    setStatusText('');
+    stopLiveAudio();
+    stopMicStreaming();
+    try { await liveSessionRef.current?.interrupt?.(); } catch (_) {}
+    try { await liveSessionRef.current?.disconnect?.(); } catch (_) {}
+    liveSessionRef.current = null;
+    setLiveConnected(false);
+    setSentChunks(0);
+    setReceivedChunks(0);
+    setIsListening(false);
+    setIsSpeaking(false);
+    setState('Idle');
+  }, [stopLiveAudio, stopMicStreaming]);
+
   const startMicStreaming = useCallback(async () => {
     if (micActiveRef.current) return;
     if (!navigator?.mediaDevices?.getUserMedia) throw new Error('getUserMedia is not available');
@@ -209,7 +224,11 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
       liveSessionRef.current
         ?.sendAudioChunk(base64, 'audio/pcm;rate=16000')
         .then(() => setSentChunks(v => v + 1))
-        .catch(() => {});
+        .catch((err: any) => {
+          const msg = err?.message || String(err);
+          pushDebugEvent(`Live: sendAudioChunk failed: ${msg}`);
+          setStatusText(msg);
+        });
     };
 
     source.connect(processor);
@@ -468,6 +487,23 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
 
     // Capture screen context
     const screenshot = await captureScreen();
+    if (!screenshot) {
+      const msg = 'Screen capture failed. Check OS permissions (screen recording) and Electron desktopCapturer.';
+      pushDebugEvent(msg);
+      setStatusText(msg);
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: `Error: ${msg}`,
+        timestamp: new Date(),
+        status: 'error',
+      };
+      setMessages(prev => [...prev, errorMsg]);
+      setCurrentResponse({ explanation: msg, actions: [], status: 'error' });
+      setDisplayedText(msg);
+      setState('Responding');
+      return;
+    }
 
     // Fetch contextual data from Electron if available
     const api = (window as any).omniAPI;
@@ -475,10 +511,18 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
     let screenDimensions = undefined;
     let environmentInfo = undefined;
     if (api?.getVisualBuffer) {
-      try { visualBuffer = await api.getVisualBuffer(); } catch (e) { console.error(e); }
+      try { visualBuffer = await api.getVisualBuffer(); } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getVisualBuffer failed: ${msg}`);
+        setStatusText(`getVisualBuffer failed: ${msg}`);
+      }
     }
     if (api?.getScreenDimensions) {
-      try { screenDimensions = await api.getScreenDimensions(); } catch (e) { console.error(e); }
+      try { screenDimensions = await api.getScreenDimensions(); } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getScreenDimensions failed: ${msg}`);
+        setStatusText(`getScreenDimensions failed: ${msg}`);
+      }
     }
     if (api?.getEnvInfo) {
       try {
@@ -489,7 +533,11 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
           nodeVersion: info.nodeVersion,
           electronVersion: info.electronVersion,
         };
-      } catch (e) { console.error(e); }
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        pushDebugEvent(`getEnvInfo failed: ${msg}`);
+        setStatusText(`getEnvInfo failed: ${msg}`);
+      }
     }
 
     // Call Gemini with conversation history + visual context
@@ -537,17 +585,19 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
       }
     } catch (err: any) {
       console.error('Gemini API error:', err);
-      pushDebugEvent(`AI error: ${err.message || String(err)}`);
+      const errMsg = err?.message || String(err);
+      pushDebugEvent(`AI error: ${errMsg}`);
+      setStatusText(errMsg);
       const errorMsg: ChatMessage = {
         id: generateId(),
         role: 'assistant',
-        content: `Error: ${err.message || 'Failed to get AI response. Check API key.'}`,
+        content: `Error: ${errMsg}`,
         timestamp: new Date(),
         status: 'error',
       };
       setMessages(prev => [...prev, errorMsg]);
-      setCurrentResponse({ explanation: err.message || 'Failed to get AI response.', actions: [], status: 'error' });
-      setDisplayedText(err.message || 'Failed to get AI response.');
+      setCurrentResponse({ explanation: errMsg, actions: [], status: 'error' });
+      setDisplayedText(errMsg);
       setState('Responding');
     }
   };
@@ -665,14 +715,11 @@ export default function OverlayWidget({ onAction }: { onAction: (action: SetupAc
                       <span className="text-[11px] text-white/60 font-medium">
                         {liveConnected
                           ? (isListening ? `listening · ↑${sentChunks} ↓${receivedChunks}` : `ready · ↑${sentChunks} ↓${receivedChunks}`)
-                          : 'connecting...'}
+                          : (statusText ? statusText : 'connecting...')}
                       </span>
                       <button
                         onClick={async () => {
-                          setStatusText('');
-                          stopLiveAudio();
-                          stopMicStreaming();
-                          try { await liveSessionRef.current?.interrupt?.(); } catch (_) {}
+                          await resetToIdle();
                         }}
                         className="ml-2 px-3 py-1 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-[11px] font-semibold text-white/70"
                       >

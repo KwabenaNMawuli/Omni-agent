@@ -29,6 +29,30 @@ async function generateWithFallback(args: {
   throw new Error(message);
 }
 
+function formatGenAIError(err: any): string {
+  if (!err) return 'Unknown error';
+  if (typeof err === 'string') return err;
+
+  const parts: string[] = [];
+  const msg = err?.message || err?.error?.message;
+  if (msg) parts.push(String(msg));
+
+  const status = err?.status || err?.code || err?.error?.code;
+  if (status) parts.push(`status=${status}`);
+
+  const details = err?.error?.details || err?.details;
+  if (Array.isArray(details) && details.length) {
+    const d0 = details[0];
+    const dmsg = d0?.message || d0?.reason;
+    if (dmsg) parts.push(`details=${dmsg}`);
+  }
+
+  const causeMsg = err?.cause?.message;
+  if (causeMsg) parts.push(`cause=${causeMsg}`);
+
+  return parts.filter(Boolean).join(' | ') || 'Unknown error';
+}
+
 function getAI(): GoogleGenAI {
   if (!_ai) {
     // In Vite renderer builds, env vars are available via import.meta.env.
@@ -77,6 +101,28 @@ export function createLiveAgentSession(args?: {
   let readerTask: Promise<void> | null = null;
   const handlers = new Set<(e: LiveAgentEvent) => void>();
 
+  const isAsyncIterable = (obj: any): obj is AsyncIterable<any> => {
+    return !!obj && typeof obj[Symbol.asyncIterator] === 'function';
+  };
+
+  const getEventEmitter = (obj: any): any | null => {
+    if (!obj) return null;
+    if (typeof obj?.on === 'function') return obj;
+    if (typeof obj?.conn?.on === 'function') return obj.conn;
+    if (typeof obj?.connection?.on === 'function') return obj.connection;
+    return null;
+  };
+
+  const describeObject = (obj: any): string => {
+    try {
+      if (!obj) return String(obj);
+      const keys = Object.keys(obj);
+      return `type=${typeof obj} ctor=${obj?.constructor?.name || 'unknown'} keys=[${keys.slice(0, 20).join(', ')}]`;
+    } catch {
+      return 'uninspectable session object';
+    }
+  };
+
   const emit = (e: LiveAgentEvent) => {
     for (const h of handlers) h(e);
   };
@@ -110,11 +156,11 @@ export function createLiveAgentSession(args?: {
 
       readerTask = (async () => {
         try {
-          for await (const message of session) {
+          const handleServerMessage = (message: any) => {
             const sc = message?.serverContent;
             if (sc?.interrupted) {
               emit({ type: 'interrupted' });
-              continue;
+              return;
             }
 
             const parts = sc?.modelTurn?.parts || sc?.parts || [];
@@ -127,7 +173,36 @@ export function createLiveAgentSession(args?: {
                 emit({ type: 'audio', mimeType: inline.mimeType, data: inline.data });
               }
             }
+          };
+
+          if (isAsyncIterable(session)) {
+            for await (const message of session) {
+              handleServerMessage(message);
+            }
+          } else {
+            const emitter = getEventEmitter(session);
+            if (!emitter) {
+              throw new Error(
+                `Live session is not async-iterable and has no .on() handler. ${describeObject(session)}`
+              );
+            }
+
+            // Some SDK builds return an event-emitter-like session (or expose it under .conn).
+            await new Promise<void>((resolve, reject) => {
+              const onMessage = (m: any) => handleServerMessage(m);
+              const onError = (e: any) => reject(e);
+              const onClose = () => resolve();
+
+              try {
+                emitter.on('message', onMessage);
+                emitter.on('error', onError);
+                emitter.on('close', onClose);
+              } catch (e) {
+                reject(e);
+              }
+            });
           }
+
           // Iterator ended -> treat as disconnected
           if (connected) {
             connected = false;
@@ -367,7 +442,7 @@ RESPONSE FORMAT (JSON):
       request: (model) =>
         getAI().models.generateContent({
           model,
-          contents: { parts: contents },
+          contents: [{ role: 'user', parts: contents }],
           config: {
             systemInstruction,
             responseMimeType: "application/json",
@@ -410,12 +485,13 @@ RESPONSE FORMAT (JSON):
     const parsed = JSON.parse(response.text || "{}") as GeminiResponse;
     _lastGoodThinkingModel = model;
     return { ...parsed, modelUsed: model };
-  } catch (error) {
+  } catch (error: any) {
+    const msg = formatGenAIError(error);
     console.error("Gemini API Error:", error);
     return {
-      explanation: "I encountered an error connecting to the AI service. Please check your API key and try again.",
+      explanation: `Gemini request failed: ${msg}`,
       actions: [],
-      status: 'error'
+      status: 'error',
     };
   }
 }
@@ -428,7 +504,7 @@ export async function generateSpeech(text: string): Promise<string | null> {
   try {
     const response = await getAI().models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text: `Say clearly and helpfully: ${text}` }] }],
+      contents: [{ role: 'user', parts: [{ text: `Say clearly and helpfully: ${text}` }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
@@ -441,7 +517,7 @@ export async function generateSpeech(text: string): Promise<string | null> {
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     return base64Audio || null;
-  } catch (error) {
+  } catch (error: any) {
     console.error("TTS Error:", error);
     return null;
   }
